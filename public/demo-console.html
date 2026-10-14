@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Demo do console 3D</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #07080b; color: #ddd; font: 14px system-ui, sans-serif; overflow: hidden; }
+  #stage { position: fixed; inset: 0; }
+  #ui { position: fixed; left: 0; right: 0; bottom: 0; display: flex; flex-wrap: wrap; gap: 8px; justify-content: center;
+        padding: 12px 16px calc(12px + env(safe-area-inset-bottom)); background: linear-gradient(transparent, rgba(0,0,0,.6)); }
+  button { font: inherit; color: #eee; background: rgba(255,255,255,.08); border: 1px solid rgba(255,255,255,.15);
+           border-radius: 999px; padding: 8px 14px; cursor: pointer; backdrop-filter: blur(6px); }
+  button:hover { background: rgba(255,255,255,.16); }
+  button:disabled { opacity: .45; cursor: default; }
+  .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; vertical-align: -1px; }
+</style>
+<script type="importmap">{"imports":{"three":"/vendor/three.module.js","three/addons/":"/vendor/addons/"}}</script>
+</head>
+<body>
+<div id="stage"></div>
+<div id="ui"></div>
+<script type="module">
+  import * as THREE from "three";
+  import { createConsoleScene } from "./js/console-scene.js";
+
+  const games = [
+    { id: "g1", title: "Shadow Racer", color: "#e8452c" },
+    { id: "g2", title: "Crystal Kingdom Chronicles", color: "#2f7bff" },
+    { id: "g3", title: "Jungle Dash", color: "#2fbf5b" },
+  ];
+
+  const s = createConsoleScene(document.getElementById("stage"));
+  window.consoleScene = s;
+
+  // ?crt uses the real CRT TV (js/crt-tv.js) with a test pattern; otherwise a
+  // placeholder with the same footprint and screen size.
+  if (new URLSearchParams(location.search).has("crt")) {
+    const { createCrtTv } = await import("./js/crt-tv.js");
+    const src = document.createElement("canvas");
+    src.width = 640; src.height = 480;
+    const g = src.getContext("2d");
+    ["#fff", "#ff0", "#0ff", "#0f0", "#f0f", "#f00", "#00f"].forEach((c, i) => { g.fillStyle = c; g.fillRect(i * 640 / 7, 0, 640 / 7 + 1, 480); });
+    document.body.append(src);
+    const tv = createCrtTv({ sourceCanvas: src });
+    s.tvAnchor.add(tv.object3d);
+    s.onFrame((dt) => tv.update(dt, s.renderer));
+    tv.setPower(true); tv.setSignal(true);
+  } else {
+    const tv = new THREE.Group();
+    const shell = new THREE.Mesh(new THREE.BoxGeometry(0.7, 0.55, 0.5),
+      new THREE.MeshStandardMaterial({ color: "#2a2b30", roughness: 0.6 }));
+    shell.position.y = 0.287; shell.castShadow = shell.receiveShadow = true;
+    const screen = new THREE.Mesh(new THREE.PlaneGeometry(0.488, 0.366),
+      new THREE.MeshBasicMaterial({ color: "#1d2a33" }));
+    screen.position.set(0, 0.327, 0.2501);
+    tv.add(shell, screen);
+    s.tvAnchor.add(tv);
+    s.invalidate();
+  }
+
+  const ui = document.getElementById("ui");
+  const buttons = [];
+  const add = (html, fn) => {
+    const b = document.createElement("button");
+    b.innerHTML = html;
+    b.onclick = async () => {
+      buttons.forEach((x) => (x.disabled = true));
+      try { await fn(); } finally { buttons.forEach((x) => (x.disabled = false)); }
+    };
+    ui.appendChild(b); buttons.push(b);
+  };
+  for (const g of games) add(`<span class="dot" style="background:${g.color}"></span>${g.title}`, () => s.insertDisc(g));
+  add("Ejetar", () => s.ejectDisc());
+  add("Focar TV", () => s.focusTv());
+  add("Focar console", () => s.focusConsole());
+</script>
+</body>
+</html>

@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Biblioteca de jogos</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background:
+      radial-gradient(60% 45% at 50% 0%, rgba(255, 170, 90, .10), transparent 70%),
+      radial-gradient(80% 60% at 15% 100%, rgba(60, 90, 180, .18), transparent 70%),
+      #050609;
+    color: #eef0f6; font: 15px 'Inter', 'Segoe UI', Roboto, 'Adwaita Sans', 'Noto Sans', Arial, sans-serif; overflow-x: hidden;
+  }
+  #app { position: fixed; inset: 0; }
+  #toast {
+    position: fixed; left: 50%; bottom: 16px; translate: -50% 0; z-index: 50; max-width: calc(100vw - 32px);
+    padding: 10px 16px; border-radius: 12px; background: #11141c; border: 1px solid rgba(255,255,255,.12);
+    box-shadow: 0 10px 40px rgba(0,0,0,.6); font-size: 14px;
+  }
+  #toast[hidden] { display: none; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div id="toast" role="status" hidden></div>
+<script type="module">
+  import { createLibraryUI } from "./js/library.js";
+
+  const toast = document.getElementById("toast");
+  window.libraryUI = createLibraryUI(document.getElementById("app"), {
+    onPlay(game, file) {
+      console.log("onPlay", game, file);
+      toast.textContent = `Jogar: ${game.title} (${file.name}, ${(file.size / 2 ** 20).toFixed(1)} MB)`;
+      toast.hidden = false;
+      clearTimeout(toast.t);
+      toast.t = setTimeout(() => (toast.hidden = true), 4000);
+    },
+  });
+
+  // Self-check: open demo-library.html?selftest and read the console.
+  if (new URLSearchParams(location.search).has("selftest")) {
+    const lib = await import("./js/library.js");
+    const assert = (c, m) => { if (!c) throw new Error("FALHOU: " + m); };
+    const n = lib.normalizeSerial;
+    assert(n("SLUS_209.46") === "SLUS-20946", "underscore+ponto");
+    assert(n("slus-20946") === "SLUS-20946", "minúsculas+hífen");
+    assert(n("SCES_533.26;1") === "SCES-53326", "versão ;1");
+    assert(n("SLUS20946") === "SLUS-20946", "sem separador");
+    assert(n("readme.txt") === null, "não-serial");
+    const p = lib.parseSystemCnf;
+    assert(p("BOOT2 = cdrom0:\\SLUS_209.46;1\r\nVER = 1.03\r\nVMODE = NTSC\r\n") === "SLUS-20946", "BOOT2 padrão");
+    assert(p("BOOT2=cdrom0:\\SCES_533.26;1") === "SCES-53326", "sem espaços");
+    assert(p("BOOT2 = cdrom0:\\DATA\\SLPS_250.50;1") === "SLPS-25050", "subpasta");
+    assert(p("VER = 1.00") === null, "sem BOOT2");
+    const all = lib.GAMES.flatMap((g) => g.serials);
+    assert(all.every((s) => n(s) === s), "catálogo canônico");
+    assert(new Set(all).size === all.length, "seriais únicos");
+    // Minimal in-memory ISO9660: PVD at 16, root dir at 18, SYSTEM.CNF at 19.
+    const iso = new Uint8Array(20 * 2048), dv = new DataView(iso.buffer);
+    const rec = (off, name, lba, size, dir) => {
+      const nb = new TextEncoder().encode(name), len = 33 + nb.length + (nb.length % 2 ? 0 : 1);
+      iso[off] = len; dv.setUint32(off + 2, lba, true); dv.setUint32(off + 10, size, true);
+      iso[off + 25] = dir ? 2 : 0; iso[off + 32] = nb.length; iso.set(nb, off + 33);
+      return off + len;
+    };
+    iso[16 * 2048] = 1; iso.set(new TextEncoder().encode("CD001"), 16 * 2048 + 1);
+    rec(16 * 2048 + 156, "\0", 18, 2048, true);
+    let o = rec(18 * 2048, "\0", 18, 2048, true);
+    o = rec(o, "\x01", 18, 2048, true);
+    const cnf = new TextEncoder().encode("BOOT2 = cdrom0:\\SCUS_973.99;1\r\nVER = 1.00\r\n");
+    rec(o, "SYSTEM.CNF;1", 19, cnf.length, false);
+    iso.set(cnf, 19 * 2048);
+    assert(await lib.detectSerial(new File([iso], "t.iso")) === "SCUS-97399", "detectSerial .iso");
+    assert(await lib.detectSerial(new File([iso], "t.cso")) === null, "cso -> null");
+
+    // RemoteFile: block cache over a fake Range-capable fetch.
+    const B = lib.REMOTE_BLOCK, data = new Uint8Array(B * 3 + 1234);
+    for (let i = 0; i < data.length; i++) data[i] = (i * 7 + (i >> 11)) & 255;
+    const ranges = [];
+    const fakeFetch = async (url, { headers }) => {
+      const [, a, b] = /bytes=(\d+)-(\d+)/.exec(headers.Range).map(Number);
+      ranges.push([a, b]);
+      await new Promise((r) => setTimeout(r, 5));
+      return { status: 206, arrayBuffer: async () => data.slice(a, b + 1).buffer };
+    };
+    const rf = new lib.RemoteFile("/x.iso", "x.iso", data.length, { fetchImpl: fakeFetch });
+    const same = (u, a, b) => u.length === b - a && u.every((v, k) => v === data[a + k]);
+    const rd = async (a, b) => new Uint8Array(await rf.slice(a, b).arrayBuffer());
+    assert(same(await rd(0, 2048), 0, 2048), "setor 0");
+    assert(rf.requests === 2, "bloco 0 + read-ahead do bloco 1");
+    assert(same(await rd(4096, 6144), 4096, 6144) && rf.requests === 2, "acerto no cache");
+    assert(same(await rd(B - 100, B + 100), B - 100, B + 100), "atravessa blocos");
+    const rf2 = new lib.RemoteFile("/x.iso", "x.iso", data.length, { fetchImpl: fakeFetch });
+    const [x, y] = await Promise.all([rf2.slice(2 * B, 2 * B + 10).arrayBuffer(), rf2.slice(2 * B + 50, 2 * B + 60).arrayBuffer()]);
+    assert(same(new Uint8Array(x), 2 * B, 2 * B + 10) && same(new Uint8Array(y), 2 * B + 50, 2 * B + 60), "concorrentes");
+    assert(rf2.requests === 2, "pedidos concorrentes do mesmo bloco viram 1 (+ read-ahead)");
+    assert(same(await rd(data.length - 5, data.length + 99), data.length - 5, data.length), "fim do arquivo (corte)");
+    assert(ranges.every(([a, b]) => b < data.length), "nunca pede além do tamanho");
+    assert(same(new Uint8Array(await rf.arrayBuffer()), 0, data.length), "arrayBuffer inteiro");
+    const zeros = async (u, { headers }) => {
+      const [, a, b] = /bytes=(\d+)-(\d+)/.exec(headers.Range).map(Number);
+      return { status: 206, arrayBuffer: async () => new ArrayBuffer(b - a + 1) };
+    };
+    const big = new lib.RemoteFile("/b", "b.iso", B * 100, { fetchImpl: zeros });
+    for (let i = 0; i < 40; i++) await big.slice(i * B, i * B + 2048).arrayBuffer();
+    assert(big.blocks.size <= 24 && !big.blocks.has(0) && big.blocks.has(39), "LRU limitado, descarta o mais antigo");
+    let fails = 1;
+    const flaky = new lib.RemoteFile("/y", "y", 10, { fetchImpl: async (u, o) => (fails-- > 0 ? { status: 503 } : fakeFetch(u, o)) });
+    assert(same(new Uint8Array(await flaky.slice(0, 10).arrayBuffer()), 0, 10), "retry após erro");
+    const bad = new lib.RemoteFile("/z", "z", 10, { fetchImpl: async () => ({ status: 200, arrayBuffer: async () => new ArrayBuffer(10) }) });
+    assert(await bad.slice(0, 10).arrayBuffer().then(() => false, () => true), "200 sem Range é erro");
+    assert(await lib.detectSerial(new lib.RemoteFile("/i", "t.iso", iso.length, { fetchImpl: async (u, { headers }) => {
+      const [, a, b] = /bytes=(\d+)-(\d+)/.exec(headers.Range).map(Number);
+      return { status: 206, arrayBuffer: async () => iso.slice(a, b + 1).buffer };
+    } })) === "SCUS-97399", "detectSerial em RemoteFile");
+    console.log("selftest OK");
+    document.title = "selftest OK";
+  }
+</script>
+</body>
+</html>

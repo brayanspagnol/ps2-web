@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Teste do emulador</title>
+<style>
+  body { margin: 0; padding: 16px; background: #111; color: #ddd; font: 14px system-ui, sans-serif; }
+  canvas { display: block; background: #000; outline: 1px solid #333; max-width: 100%; }
+  #status { margin: 8px 0; font-family: monospace; }
+  .err { color: #f66; }
+</style>
+</head>
+<body>
+<h1>Passo 1: Play! em WebAssembly</h1>
+<p>Escolha um dump seu (ISO, CSO, CHD, ISZ, BIN ou ELF). Nada é enviado: o arquivo é lido localmente.</p>
+<input type="file" id="file" accept=".iso,.cso,.chd,.isz,.bin,.elf" disabled>
+<div id="status">Carregando emulador…</div>
+<canvas id="outputCanvas" width="640" height="480" tabindex="-1"></canvas>
+<p>Controles: setas = D-pad, Z = X, X = Círculo, A = Quadrado, S = Triângulo, Enter = Start, 1/2 = L1/L2, 8/9 = R1/R2, FHTG = analógico esq.</p>
+<script type="module">
+  import * as emu from "./js/emulator.js";
+  const status = document.getElementById("status");
+  const input = document.getElementById("file");
+  const fail = (e) => { status.textContent = "Erro: " + e.message; status.className = "err"; console.error(e); };
+
+  try {
+    await emu.init();
+    status.textContent = "Emulador pronto. Escolha um jogo.";
+    input.disabled = false;
+  } catch (e) { fail(e); }
+
+  input.addEventListener("change", async () => {
+    const file = input.files[0];
+    if (!file) return;
+    try {
+      await emu.boot(file);
+      status.className = "";
+      emu.takeFrames();
+      setInterval(() => { status.textContent = `${file.name} | ${emu.takeFrames()} FPS`; }, 1000);
+    } catch (e) { fail(e); }
+  });
+</script>
+</body>
+</html>

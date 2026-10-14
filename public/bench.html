@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Emulator Bench</title>
+<style>
+  :root { --bg: #111; --fg: #ddd; }
+  body { margin: 0; padding: 16px; background: var(--bg); color: var(--fg); font: 13px monospace; }
+  canvas { display: block; background: #000; max-width: 100%; }
+  pre { white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<!-- Dev harness for performance work (see OPTIMIZATION.md).
+     ?game=<file in /games>&emu=<variant>&state=<OPFS save-state name to load after boot>
+     &blockcache=0 boots without the persistent JIT block cache, &blockcache=clear empties this game's cache first.
+     window.bench: save(name), load(name), states(), prof (array of per-second samples),
+     clearBlockCache(), flushBlockCache(), blockCacheUsage(). -->
+<div id="status">loading…</div>
+<canvas id="outputCanvas" width="640" height="480" tabindex="-1"></canvas>
+<pre id="prof"></pre>
+<script type="module">
+  window.__consoleLog = [];
+  for (const k of ["log", "warn", "error"]) {
+    const orig = console[k].bind(console);
+    console[k] = (...a) => { window.__consoleLog.push(k + ": " + a.join(" ")); if (window.__consoleLog.length > 500) window.__consoleLog.shift(); orig(...a); };
+  }
+  window.addEventListener("error", (e) => window.__consoleLog.push("onerror: " + e.message));
+  import * as emu from "./js/emulator.js";
+  const q = new URLSearchParams(location.search);
+  const status = document.getElementById("status");
+  const profEl = document.getElementById("prof");
+  const mod = await emu.init();
+  const opfs = await navigator.storage.getDirectory();
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  async function waitState() {
+    for (;;) { const s = mod.stateStatus(); if (s !== -1) return s; await sleep(50); }
+  }
+  const bench = window.bench = {
+    mod, prof: [], log: [],
+    async save(name) {
+      mod.saveState("/work/state.zip");
+      if (await waitState() !== 1) throw new Error("saveState failed");
+      const data = mod.FS.readFile("/work/state.zip");
+      const fh = await opfs.getFileHandle(name, { create: true });
+      const w = await fh.createWritable(); await w.write(data); await w.close();
+      return data.length;
+    },
+    async load(name) {
+      const fh = await opfs.getFileHandle(name);
+      const data = new Uint8Array(await (await fh.getFile()).arrayBuffer());
+      mod.FS.writeFile("/work/state.zip", data);
+      mod.loadState("/work/state.zip");
+      if (await waitState() !== 1) throw new Error("loadState failed");
+      return data.length;
+    },
+    clearBlockCache: emu.clearBlockCache, flushBlockCache: emu.flushBlockCache, blockCacheUsage: emu.blockCacheUsage,
+    async states() { const r = []; for await (const [n, h] of opfs.entries()) r.push(n + ":" + (await h.getFile()).size); return r; },
+  };
+
+  const game = q.get("game");
+  if (game) {
+    const url = new URL("games/" + encodeURIComponent(game), location.href).href;
+    const size = Number((await fetch(url, { method: "HEAD" })).headers.get("content-length"));
+    if (q.get("blockcache") === "clear") await emu.clearBlockCache(`${game}-${size}`);
+    await emu.boot({ name: game, size, url, slice: () => { throw new Error("url only"); } }, { blockCache: q.get("blockcache") !== "0" });
+    if (q.get("state")) {
+      await sleep(1500);
+      try { await bench.load(q.get("state")); status.textContent = "state loaded"; }
+      catch (e) { status.textContent = "state load error: " + e.message; }
+    }
+    if (q.get("ee")) { const [n, d] = q.get("ee").split("/").map(Number); mod.setEeFrequencyScale(n, d); }
+    emu.takeFrames();
+    mod.getProfile();
+    const t0 = performance.now();
+    setInterval(() => {
+      const p = JSON.parse(mod.getProfile());
+      p.fps = emu.takeFrames();
+      p.t = Math.round((performance.now() - t0) / 1000);
+      if (p.log) { bench.log.push(`[t=${p.t}] ` + p.log); console.log(p.log); }
+      delete p.log;
+      bench.prof.push(p);
+      if (bench.prof.length > 3600) bench.prof.shift();
+      const z = Object.entries(p.zonesMs).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k}=${v.toFixed(0)}`).join(" ");
+      const ee = p.eeTotal ? (100 * (1 - p.eeIdle / p.eeTotal)).toFixed(0) : "-";
+      const iop = p.iopTotal ? (100 * (1 - p.iopIdle / p.iopTotal)).toFixed(0) : "-";
+      status.textContent = `t=${p.t}s fps=${p.fps} vbl=${p.vblanks} ee=${ee}% iop=${iop}% gsBusy=${p.gsBusyMs.toFixed(0)}ms jit=${p.compiles} cacheHits=${p.cacheHits}`;
+      profEl.textContent = z + "\nEE PCs " + JSON.stringify(p.eePcs) + "\nIOP PCs " + JSON.stringify(p.iopPcs);
+    }, 1000);
+  }
+</script>
+</body>
+</html>

@@ -1,0 +1,2821 @@
+diff --git a/GameConfig.xml b/GameConfig.xml
+index 05d75e3f..7383950e 100644
+--- a/GameConfig.xml
++++ b/GameConfig.xml
+@@ -160,4 +160,7 @@
+ 		<!-- SLUS-21240 Version 2.01 -->
+ 		<IdleLoopBlock Address="0x00427F40" CheckBlockKey="6D8515A293E38030EE880D6C915CEAA2;12"/>
+ 	</GameConfig>
++	<GameConfig Executable="SLES_525.41;1" Title="Grand Theft Auto: San Andreas (Europe)">
++		<IdleLoopBlock Address="0x0034DFD8" Description="Polling loop waiting for the render queue (interrupt-driven counters), ~75% of EE time in cutscenes/gameplay." />
++	</GameConfig>
+ </GameConfigs>
+diff --git a/Source/BasicBlock.cpp b/Source/BasicBlock.cpp
+index 4c460e64..56070794 100644
+--- a/Source/BasicBlock.cpp
++++ b/Source/BasicBlock.cpp
+@@ -1,8 +1,14 @@
++#include <atomic>
++#include "Profiler.h"
+ #include "BasicBlock.h"
+ #include "MemStream.h"
+ #include "offsetof_def.h"
+ #include "MipsJitter.h"
+ #include "Jitter_CodeGenFactory.h"
++#ifdef __EMSCRIPTEN__
++#include "BlockCache.h"
++#include "xxhash.h"
++#endif
+ 
+ #if defined(AOT_BUILD_CACHE) || defined(AOT_USE_CACHE)
+ #define AOT_ENABLED
+@@ -74,10 +80,55 @@ void CBasicBlock::SetAotBlockOutputStream(Framework::CStdStream* outputStream)
+ 
+ #endif
+ 
++#ifdef PROFILE
++std::atomic<uint32> g_blockCompileCount = 0;
++#endif
++
+ void CBasicBlock::Compile()
+ {
++#ifdef PROFILE
++	static const auto compileZone = CProfiler::GetInstance().RegisterZone("COMPILE");
++	CProfilerZone profilerZone(compileZone);
++	g_blockCompileCount++;
++#endif
+ #ifndef AOT_USE_CACHE
+ 
++#if defined(__EMSCRIPTEN__) && !defined(AOT_ENABLED)
++	//Persistent block cache: reuse the wasm bytes generated for the same code in an earlier run.
++	//Code is position independent (context-relative accesses, PC-relative branches, import table
++	//indexes fixed at startup), so the key is the block contents plus everything else that changes codegen.
++	BlockCache::KEY cacheKey = {};
++	bool useBlockCache = BlockCache::IsEnabled() && !IsEmpty();
++	if(useBlockCache)
++	{
++		uint32 wordCount = ((m_end - m_begin) / 4) + 1;
++		thread_local std::vector<uint32> words;
++		words.resize(wordCount);
++		for(uint32 i = 0; i < wordCount; i++)
++		{
++			words[i] = m_context.m_pMemoryMap->GetInstruction(m_begin + (i * 4));
++		}
++		auto xxHash = XXH3_128bits(words.data(), wordCount * 4);
++		cacheKey.category = m_category;
++		cacheKey.size = wordCount * 4;
++		cacheKey.hints = m_blockCompileHints;
++		cacheKey.variant = m_cacheVariant;
++		cacheKey.hash[0] = xxHash.low64;
++		cacheKey.hash[1] = xxHash.high64;
++
++		thread_local std::vector<uint8> cachedCode;
++		if(BlockCache::Find(cacheKey, cachedCode))
++		{
++#ifdef PROFILE
++			static const auto compileWasmZone = CProfiler::GetInstance().RegisterZone("COMPILE_WASM");
++			CProfilerZone profilerZone(compileWasmZone);
++#endif
++			m_function = CMemoryFunction(cachedCode.data(), cachedCode.size());
++			return;
++		}
++	}
++#endif
++
+ 	Framework::CMemStream stream;
+ 	{
+ 		static
+@@ -98,7 +149,20 @@ void CBasicBlock::Compile()
+ 		jitter->End();
+ 	}
+ 
+-	m_function = CMemoryFunction(stream.GetBuffer(), stream.GetSize());
++	{
++#ifdef PROFILE
++		static const auto compileWasmZone = CProfiler::GetInstance().RegisterZone("COMPILE_WASM");
++		CProfilerZone profilerZone(compileWasmZone);
++#endif
++		m_function = CMemoryFunction(stream.GetBuffer(), stream.GetSize());
++	}
++
++#if defined(__EMSCRIPTEN__) && !defined(AOT_ENABLED)
++	if(useBlockCache && m_cacheable)
++	{
++		BlockCache::Add(cacheKey, stream.GetBuffer(), stream.GetSize());
++	}
++#endif
+ 
+ #ifdef VTUNE_ENABLED
+ 	if(iJIT_IsProfilingActive() == iJIT_SAMPLING_ON)
+@@ -191,6 +255,11 @@ void CBasicBlock::AddBlockCompileHints(uint32 compileHints)
+ 	m_blockCompileHints |= compileHints;
+ }
+ 
++void CBasicBlock::AddCacheVariant(uint32 variant)
++{
++	m_cacheVariant |= variant;
++}
++
+ void CBasicBlock::CompileRange(CMipsJitter* jitter)
+ {
+ 	if(IsEmpty())
+diff --git a/Source/BasicBlock.h b/Source/BasicBlock.h
+index 56ef0adc..cccf8b72 100644
+--- a/Source/BasicBlock.h
++++ b/Source/BasicBlock.h
+@@ -1,138 +1,143 @@
+-#pragma once
+-
+-#include "MIPS.h"
+-#include "MemoryFunction.h"
+-#ifdef AOT_BUILD_CACHE
+-#include "StdStream.h"
+-#include <mutex>
+-#endif
+-
+-enum BLOCK_CATEGORY : uint32
+-{
+-	BLOCK_CATEGORY_UNKNOWN = 0,
+-	BLOCK_CATEGORY_PS2_EE = 0x65650000,
+-	BLOCK_CATEGORY_PS2_IOP = 0x696F7000,
+-	BLOCK_CATEGORY_PS2_VU = 0x76750000,
+-	BLOCK_CATEGORY_PSP = 0x50535000,
+-};
+-
+-#pragma pack(push, 1)
+-struct AOT_BLOCK_KEY
+-{
+-	BLOCK_CATEGORY category;
+-	uint128 hash;
+-	uint32 size;
+-
+-	bool operator<(const AOT_BLOCK_KEY& k2) const
+-	{
+-		const auto& k1 = (*this);
+-		return std::tie(k1.category, k1.hash, k1.size) <
+-		       std::tie(k2.category, k2.hash, k2.size);
+-	}
+-};
+-#pragma pack(pop)
+-static_assert(sizeof(AOT_BLOCK_KEY) == 0x18, "AOT_BLOCK_KEY must be 24 bytes long.");
+-
+-namespace Jitter
+-{
+-	class CJitter;
+-};
+-
+-extern "C"
+-{
+-	void EmptyBlockHandler(CMIPS*);
+-	void NextBlockTrampoline(CMIPS*);
+-	void BranchBlockTrampoline(CMIPS*);
+-}
+-
+-enum LINK_SLOT
+-{
+-	LINK_SLOT_NEXT,
+-	LINK_SLOT_BRANCH,
+-	LINK_SLOT_MAX,
+-};
+-
+-//Block outgoing link
+-struct BLOCK_OUT_LINK
+-{
+-	LINK_SLOT slot;    //slot used in the source block
+-	uint32 srcAddress; //address of source block
+-	bool live;         //live if linked to another block, otherwise, link is pending
+-};
+-
+-//Block outgoing links map (key: target link address, value: struct describing link status)
+-typedef std::multimap<uint32, BLOCK_OUT_LINK> BlockOutLinkMap;
+-
+-//When block linking is used, each basic block will maintain pointers
+-//to their outgoing link definitions inside the map
+-typedef BlockOutLinkMap::iterator BlockOutLinkPointer;
+-
+-class CBasicBlock : public std::enable_shared_from_this<CBasicBlock>
+-{
+-public:
+-	CBasicBlock(CMIPS&, uint32 = MIPS_INVALID_PC, uint32 = MIPS_INVALID_PC, BLOCK_CATEGORY = BLOCK_CATEGORY_UNKNOWN);
+-	virtual ~CBasicBlock() = default;
+-	void Execute();
+-	void Compile();
+-	virtual void CompileRange(CMipsJitter*);
+-
+-	void AddBlockCompileHints(uint32);
+-
+-	uint32 GetBeginAddress() const;
+-	uint32 GetEndAddress() const;
+-	bool IsCompiled() const;
+-	bool IsEmpty() const;
+-
+-	uint32 GetRecycleCount() const;
+-	void SetRecycleCount(uint32);
+-
+-	bool HasLinkSlot(LINK_SLOT) const;
+-	BlockOutLinkPointer GetOutLink(LINK_SLOT) const;
+-	void SetOutLink(LINK_SLOT, BlockOutLinkPointer);
+-
+-	void LinkBlock(LINK_SLOT, CBasicBlock*);
+-	void UnlinkBlock(LINK_SLOT);
+-
+-#ifdef AOT_BUILD_CACHE
+-	static void SetAotBlockOutputStream(Framework::CStdStream*);
+-#endif
+-
+-	void CopyFunctionFrom(const std::shared_ptr<CBasicBlock>& basicBlock);
+-
+-protected:
+-	uint32 m_begin;
+-	uint32 m_end;
+-	BLOCK_CATEGORY m_category;
+-	CMIPS& m_context;
+-
+-	uint32 m_blockCompileHints = 0;
+-
+-	virtual void CompileProlog(CMipsJitter*);
+-	virtual void CompileEpilog(CMipsJitter*, bool);
+-
+-private:
+-	void HandleExternalFunctionReference(uintptr_t, uint32, Jitter::CCodeGen::SYMBOL_REF_TYPE);
+-
+-#ifdef DEBUGGER_INCLUDED
+-	bool HasBreakpoint() const;
+-	static uint32 BreakpointFilter(CMIPS*);
+-	static void BreakpointHandler(CMIPS*);
+-#endif
+-
+-#ifdef AOT_BUILD_CACHE
+-	static Framework::CStdStream* m_aotBlockOutputStream;
+-	static std::mutex m_aotBlockOutputStreamMutex;
+-#endif
+-
+-#ifndef AOT_USE_CACHE
+-	CMemoryFunction m_function;
+-#else
+-	void (*m_function)(void*);
+-#endif
+-	uint32 m_recycleCount = 0;
+-	BlockOutLinkPointer m_outLinks[LINK_SLOT_MAX];
+-	uint32 m_linkBlockTrampolineOffset[LINK_SLOT_MAX];
+-#ifdef _DEBUG
+-	CBasicBlock* m_linkBlock[LINK_SLOT_MAX];
+-#endif
+-};
++#pragma once
++
++#include "MIPS.h"
++#include "MemoryFunction.h"
++#ifdef AOT_BUILD_CACHE
++#include "StdStream.h"
++#include <mutex>
++#endif
++
++enum BLOCK_CATEGORY : uint32
++{
++	BLOCK_CATEGORY_UNKNOWN = 0,
++	BLOCK_CATEGORY_PS2_EE = 0x65650000,
++	BLOCK_CATEGORY_PS2_IOP = 0x696F7000,
++	BLOCK_CATEGORY_PS2_VU = 0x76750000,
++	BLOCK_CATEGORY_PSP = 0x50535000,
++};
++
++#pragma pack(push, 1)
++struct AOT_BLOCK_KEY
++{
++	BLOCK_CATEGORY category;
++	uint128 hash;
++	uint32 size;
++
++	bool operator<(const AOT_BLOCK_KEY& k2) const
++	{
++		const auto& k1 = (*this);
++		return std::tie(k1.category, k1.hash, k1.size) <
++		       std::tie(k2.category, k2.hash, k2.size);
++	}
++};
++#pragma pack(pop)
++static_assert(sizeof(AOT_BLOCK_KEY) == 0x18, "AOT_BLOCK_KEY must be 24 bytes long.");
++
++namespace Jitter
++{
++	class CJitter;
++};
++
++extern "C"
++{
++	void EmptyBlockHandler(CMIPS*);
++	void NextBlockTrampoline(CMIPS*);
++	void BranchBlockTrampoline(CMIPS*);
++}
++
++enum LINK_SLOT
++{
++	LINK_SLOT_NEXT,
++	LINK_SLOT_BRANCH,
++	LINK_SLOT_MAX,
++};
++
++//Block outgoing link
++struct BLOCK_OUT_LINK
++{
++	LINK_SLOT slot;    //slot used in the source block
++	uint32 srcAddress; //address of source block
++	bool live;         //live if linked to another block, otherwise, link is pending
++};
++
++//Block outgoing links map (key: target link address, value: struct describing link status)
++typedef std::multimap<uint32, BLOCK_OUT_LINK> BlockOutLinkMap;
++
++//When block linking is used, each basic block will maintain pointers
++//to their outgoing link definitions inside the map
++typedef BlockOutLinkMap::iterator BlockOutLinkPointer;
++
++class CBasicBlock : public std::enable_shared_from_this<CBasicBlock>
++{
++public:
++	CBasicBlock(CMIPS&, uint32 = MIPS_INVALID_PC, uint32 = MIPS_INVALID_PC, BLOCK_CATEGORY = BLOCK_CATEGORY_UNKNOWN);
++	virtual ~CBasicBlock() = default;
++	void Execute();
++	void Compile();
++	virtual void CompileRange(CMipsJitter*);
++
++	void AddBlockCompileHints(uint32);
++	//Extra codegen-affecting state (besides instruction words and compile hints) for the persistent block cache key.
++	void AddCacheVariant(uint32);
++
++	uint32 GetBeginAddress() const;
++	uint32 GetEndAddress() const;
++	bool IsCompiled() const;
++	bool IsEmpty() const;
++
++	uint32 GetRecycleCount() const;
++	void SetRecycleCount(uint32);
++
++	bool HasLinkSlot(LINK_SLOT) const;
++	BlockOutLinkPointer GetOutLink(LINK_SLOT) const;
++	void SetOutLink(LINK_SLOT, BlockOutLinkPointer);
++
++	void LinkBlock(LINK_SLOT, CBasicBlock*);
++	void UnlinkBlock(LINK_SLOT);
++
++#ifdef AOT_BUILD_CACHE
++	static void SetAotBlockOutputStream(Framework::CStdStream*);
++#endif
++
++	void CopyFunctionFrom(const std::shared_ptr<CBasicBlock>& basicBlock);
++
++protected:
++	uint32 m_begin;
++	uint32 m_end;
++	BLOCK_CATEGORY m_category;
++	CMIPS& m_context;
++
++	uint32 m_blockCompileHints = 0;
++	uint32 m_cacheVariant = 0;
++	//Cleared by CompileRange when the generated code depends on more than the block's own words.
++	bool m_cacheable = true;
++
++	virtual void CompileProlog(CMipsJitter*);
++	virtual void CompileEpilog(CMipsJitter*, bool);
++
++private:
++	void HandleExternalFunctionReference(uintptr_t, uint32, Jitter::CCodeGen::SYMBOL_REF_TYPE);
++
++#ifdef DEBUGGER_INCLUDED
++	bool HasBreakpoint() const;
++	static uint32 BreakpointFilter(CMIPS*);
++	static void BreakpointHandler(CMIPS*);
++#endif
++
++#ifdef AOT_BUILD_CACHE
++	static Framework::CStdStream* m_aotBlockOutputStream;
++	static std::mutex m_aotBlockOutputStreamMutex;
++#endif
++
++#ifndef AOT_USE_CACHE
++	CMemoryFunction m_function;
++#else
++	void (*m_function)(void*);
++#endif
++	uint32 m_recycleCount = 0;
++	BlockOutLinkPointer m_outLinks[LINK_SLOT_MAX];
++	uint32 m_linkBlockTrampolineOffset[LINK_SLOT_MAX];
++#ifdef _DEBUG
++	CBasicBlock* m_linkBlock[LINK_SLOT_MAX];
++#endif
++};
+diff --git a/Source/BlockCache.cpp b/Source/BlockCache.cpp
+new file mode 100644
+index 00000000..99e29393
+--- /dev/null
++++ b/Source/BlockCache.cpp
+@@ -0,0 +1,137 @@
++#include "BlockCache.h"
++#include <atomic>
++#include <cstring>
++#include <mutex>
++#include <unordered_map>
++#include "xxhash.h"
++
++using namespace BlockCache;
++
++namespace
++{
++	struct KeyHasher
++	{
++		size_t operator()(const KEY& key) const
++		{
++			return static_cast<size_t>(key.hash[0] ^ key.variant ^ key.hints);
++		}
++	};
++
++#pragma pack(push, 1)
++	struct ENTRY_HEADER
++	{
++		KEY key;
++		uint32 codeSize;
++		uint64 checksum; //XXH3_64 of the code bytes
++	};
++#pragma pack(pop)
++
++	//ponytail: hard cap instead of eviction; a game that outgrows it just stops adding entries.
++	constexpr size_t MAX_TOTAL_BYTES = 96 * 1024 * 1024;
++	constexpr uint32 MAX_CODE_SIZE = 1024 * 1024;
++
++	std::mutex g_mutex;
++	std::atomic<bool> g_enabled = false;
++	std::atomic<uint32> g_hits = 0;
++	std::unordered_map<KEY, std::vector<uint8>, KeyHasher> g_entries;
++	std::vector<uint8> g_pending;
++	size_t g_totalBytes = 0;
++}
++
++bool KEY::operator==(const KEY& rhs) const
++{
++	return memcmp(this, &rhs, sizeof(KEY)) == 0;
++}
++
++bool BlockCache::IsEnabled()
++{
++	return g_enabled;
++}
++
++void BlockCache::SetEnabled(bool enabled)
++{
++	g_enabled = enabled;
++}
++
++void BlockCache::Clear()
++{
++	std::lock_guard<std::mutex> lock(g_mutex);
++	g_entries.clear();
++	g_pending.clear();
++	g_pending.shrink_to_fit();
++	g_totalBytes = 0;
++}
++
++uint32 BlockCache::Load(const uint8* data, size_t size)
++{
++	std::lock_guard<std::mutex> lock(g_mutex);
++	uint32 count = 0;
++	size_t pos = 0;
++	while(size - pos >= sizeof(ENTRY_HEADER))
++	{
++		ENTRY_HEADER header;
++		memcpy(&header, data + pos, sizeof(header));
++		const uint8* code = data + pos + sizeof(header);
++		if(header.codeSize < 8 || header.codeSize > MAX_CODE_SIZE) break;
++		if(size - pos - sizeof(header) < header.codeSize) break;
++		if(memcmp(code, "\0asm", 4) != 0) break;
++		if(XXH3_64bits(code, header.codeSize) != header.checksum) break;
++		pos += sizeof(header) + header.codeSize;
++		if(g_totalBytes + header.codeSize > MAX_TOTAL_BYTES) break;
++		auto inserted = g_entries.emplace(header.key, std::vector<uint8>(code, code + header.codeSize));
++		if(inserted.second)
++		{
++			g_totalBytes += header.codeSize;
++			count++;
++		}
++	}
++	return count;
++}
++
++bool BlockCache::Find(const KEY& key, std::vector<uint8>& code)
++{
++	std::lock_guard<std::mutex> lock(g_mutex);
++	auto entryIterator = g_entries.find(key);
++	if(entryIterator == std::end(g_entries)) return false;
++	code = entryIterator->second;
++	g_hits++;
++	return true;
++}
++
++void BlockCache::Add(const KEY& key, const void* code, size_t size)
++{
++	if(size > MAX_CODE_SIZE) return;
++	std::lock_guard<std::mutex> lock(g_mutex);
++	if(g_totalBytes + size > MAX_TOTAL_BYTES) return;
++	auto codeBytes = reinterpret_cast<const uint8*>(code);
++	auto inserted = g_entries.emplace(key, std::vector<uint8>(codeBytes, codeBytes + size));
++	if(!inserted.second) return;
++	g_totalBytes += size;
++
++	ENTRY_HEADER header = {};
++	header.key = key;
++	header.codeSize = static_cast<uint32>(size);
++	header.checksum = XXH3_64bits(code, size);
++	auto headerBytes = reinterpret_cast<const uint8*>(&header);
++	g_pending.insert(g_pending.end(), headerBytes, headerBytes + sizeof(header));
++	g_pending.insert(g_pending.end(), codeBytes, codeBytes + size);
++}
++
++std::vector<uint8> BlockCache::TakePending()
++{
++	std::lock_guard<std::mutex> lock(g_mutex);
++	std::vector<uint8> result;
++	std::swap(result, g_pending);
++	return result;
++}
++
++size_t BlockCache::GetPendingSize()
++{
++	std::lock_guard<std::mutex> lock(g_mutex);
++	return g_pending.size();
++}
++
++uint32 BlockCache::TakeHitCount()
++{
++	return g_hits.exchange(0);
++}
+diff --git a/Source/BlockCache.h b/Source/BlockCache.h
+new file mode 100644
+index 00000000..4c7df53e
+--- /dev/null
++++ b/Source/BlockCache.h
+@@ -0,0 +1,38 @@
++#pragma once
++
++#include <vector>
++#include "Types.h"
++
++//Persistent cache of JIT output (WebAssembly build). CBasicBlock::Compile looks a block up by
++//the hash of its instruction words (plus category, size and compile hints/variant) and, on a hit,
++//builds its function from the cached bytes instead of running the Jitter. Storage (OPFS) is
++//handled by the JS frontend, which feeds whole cache files in with Load() and drains new entries
++//with TakePending(). All functions are thread safe.
++namespace BlockCache
++{
++#pragma pack(push, 1)
++	struct KEY
++	{
++		uint32 category;
++		uint32 size;
++		uint32 hints;
++		uint32 variant;
++		uint64 hash[2];
++
++		bool operator==(const KEY& rhs) const;
++	};
++#pragma pack(pop)
++	static_assert(sizeof(KEY) == 32);
++
++	bool IsEnabled();
++	void SetEnabled(bool);
++	void Clear();
++	//Parses serialized entries (as produced by TakePending), stops at the first bad one.
++	//Returns the number of entries accepted.
++	uint32 Load(const uint8* data, size_t size);
++	bool Find(const KEY&, std::vector<uint8>& code);
++	void Add(const KEY&, const void* code, size_t size);
++	std::vector<uint8> TakePending();
++	size_t GetPendingSize();
++	uint32 TakeHitCount();
++}
+diff --git a/Source/CMakeLists.txt b/Source/CMakeLists.txt
+index 0eb6a2eb..c15d4719 100644
+--- a/Source/CMakeLists.txt
++++ b/Source/CMakeLists.txt
+@@ -144,6 +144,8 @@ endif()
+ set(COMMON_SRC_FILES
+ 	BasicBlock.cpp
+ 	BasicBlock.h
++	BlockCache.cpp
++	BlockCache.h
+ 	BiosDebugInfoProvider.h
+ 	BlockLookupOneWay.h
+ 	BlockLookupTwoWay.h
+diff --git a/Source/COP_FPU.cpp b/Source/COP_FPU.cpp
+index 438943a2..91b89ea1 100644
+--- a/Source/COP_FPU.cpp
++++ b/Source/COP_FPU.cpp
+@@ -620,12 +620,12 @@ void CCOP_FPU::SWC1()
+ 
+ 	if(usePageLookup)
+ 	{
+-		ComputeMemAccessPageRef();
++		ComputeMemAccessPageRef(true);
+ 
+ 		m_codeGen->PushCst(0);
+ 		m_codeGen->BeginIf(Jitter::CONDITION_NE);
+ 		{
+-			ComputeMemAccessRefIdx(4);
++			ComputeMemAccessRefIdx(4, true);
+ 
+ 			m_codeGen->PushRel(offsetof(CMIPS, m_State.nCOP1[m_ft]));
+ 			m_codeGen->StoreAtRefIdx(1);
+diff --git a/Source/GenericMipsExecutor.h b/Source/GenericMipsExecutor.h
+index 2fb630fa..323ffad4 100644
+--- a/Source/GenericMipsExecutor.h
++++ b/Source/GenericMipsExecutor.h
+@@ -3,6 +3,7 @@
+ #include <unordered_set>
+ #include "MIPS.h"
+ #include "BasicBlock.h"
++#include "Profiler.h"
+ 
+ #include "BlockLookupOneWay.h"
+ #include "BlockLookupTwoWay.h"
+@@ -67,6 +68,16 @@ public:
+ 		{
+ 			uint32 address = m_context.m_State.nPC & m_addressMask;
+ 			auto block = m_blockLookup.FindBlockAt(address);
++#ifdef PROFILE
++			if(m_blockCategory == BLOCK_CATEGORY_PS2_EE)
++			{
++				static const auto blockZone = CProfiler::GetInstance().RegisterZone("EEBLOCK");
++				auto prevZone = CProfiler::GetInstance().SwapCurrentZone(blockZone);
++				block->Execute();
++				CProfiler::GetInstance().SwapCurrentZone(prevZone);
++				continue;
++			}
++#endif
+ 			block->Execute();
+ 		}
+ 		m_context.m_State.nHasException &= ~MIPS_EXCEPTION_STATUS_QUOTADONE;
+diff --git a/Source/Js_DiscImageDeviceStream.cpp b/Source/Js_DiscImageDeviceStream.cpp
+index 71d60516..3d9e823b 100644
+--- a/Source/Js_DiscImageDeviceStream.cpp
++++ b/Source/Js_DiscImageDeviceStream.cpp
+@@ -4,6 +4,72 @@
+ #include <emscripten.h>
+ #include <unistd.h>
+ 
++static std::string g_discImageUrl;
++
++void Js_SetDiscImageUrl(const std::string& url)
++{
++	g_discImageUrl = url;
++}
++
++// Runs on the calling (emulation) thread: reads [position, position + size) from
++// the URL in 1 MB blocks through a small LRU kept in this worker's global scope.
++// Returns 0 on failure so the caller can fall back to the main-thread path.
++EM_JS(int, Js_ReadDiscUrl, (const char* urlPtr, uint32 positionLow, uint32 positionHigh, void* buffer, uint32 size), {
++	const url = UTF8ToString(urlPtr);
++	let d = globalThis.__ps2Disc;
++	if(!d || d.url !== url) d = globalThis.__ps2Disc = {url : url, blocks : new Map()};
++	const BS = 1 << 20, MAX_BLOCKS = 48;
++	let pos = (positionLow >>> 0) + (positionHigh >>> 0) * 4294967296;
++	let dst = buffer >>> 0;
++	let left = size >>> 0;
++	while(left > 0)
++	{
++		const bi = Math.floor(pos / BS);
++		let b = d.blocks.get(bi);
++		if(b)
++		{
++			d.blocks.delete(bi);
++			d.blocks.set(bi, b);
++		}
++		else
++		{
++			const start = bi * BS;
++			for(let attempt = 0;; attempt++)
++			{
++				try
++				{
++					const x = new XMLHttpRequest();
++					x.open("GET", url, false);
++					x.responseType = "arraybuffer";
++					x.setRequestHeader("Range", "bytes=" + start + "-" + (start + BS - 1));
++					x.send();
++					if(x.status !== 206) throw new Error("HTTP " + x.status);
++					b = new Uint8Array(x.response);
++					break;
++				}
++				catch(e)
++				{
++					if(attempt >= 2)
++					{
++						console.error("Disc read failed at " + start + ": " + e);
++						return 0;
++					}
++				}
++			}
++			d.blocks.set(bi, b);
++			if(d.blocks.size > MAX_BLOCKS) d.blocks.delete(d.blocks.keys().next().value);
++		}
++		const off = pos - bi * BS;
++		const n = Math.min(left, b.length - off);
++		if(n <= 0) return 0;
++		HEAPU8.set(b.subarray(off, off + n), dst);
++		dst += n;
++		pos += n;
++		left -= n;
++	}
++	return 1;
++});
++
+ void CJsDiscImageDeviceStream::Seek(int64 position, Framework::STREAM_SEEK_DIRECTION whence)
+ {
+ 	switch(whence)
+@@ -38,6 +104,12 @@ uint64 CJsDiscImageDeviceStream::Read(void* buffer, uint64 size)
+ 	uint32 positionLow = static_cast<uint32>(m_position);
+ 	uint32 positionHigh = static_cast<uint32>(m_position >> 32);
+ 
++	if(!g_discImageUrl.empty() && Js_ReadDiscUrl(g_discImageUrl.c_str(), positionLow, positionHigh, buffer, static_cast<uint32>(size)))
++	{
++		m_position += size;
++		return size;
++	}
++
+ 	MAIN_THREAD_EM_ASM({
+ 		let posLow = $1 >>> 0;
+ 		let posHigh = $2 >>> 0;
+diff --git a/Source/Js_DiscImageDeviceStream.h b/Source/Js_DiscImageDeviceStream.h
+index 07026720..9940e816 100644
+--- a/Source/Js_DiscImageDeviceStream.h
++++ b/Source/Js_DiscImageDeviceStream.h
+@@ -1,6 +1,12 @@
+ #pragma once
+ 
+ #include "Stream.h"
++#include <string>
++
++// Optional URL (same-origin, must honour HTTP Range) the emulation thread reads
++// directly with synchronous XHR, bypassing the main-thread round trip per sector.
++// Empty string = read through Module.discImageDevice on the main thread.
++void Js_SetDiscImageUrl(const std::string&);
+ 
+ class CJsDiscImageDeviceStream : public Framework::CStream
+ {
+diff --git a/Source/MA_MIPSIV.cpp b/Source/MA_MIPSIV.cpp
+index 5d5bbb29..252b42a0 100644
+--- a/Source/MA_MIPSIV.cpp
++++ b/Source/MA_MIPSIV.cpp
+@@ -825,12 +825,12 @@ void CMA_MIPSIV::SD()
+ {
+ 	if(!Ensure64BitRegs()) return;
+ 
+-	ComputeMemAccessPageRef();
++	ComputeMemAccessPageRef(true);
+ 
+ 	m_codeGen->PushCst(0);
+ 	m_codeGen->BeginIf(Jitter::CONDITION_NE);
+ 	{
+-		ComputeMemAccessRefIdx(8);
++		ComputeMemAccessRefIdx(8, true);
+ 
+ 		m_codeGen->PushRel64(offsetof(CMIPS, m_State.nGPR[m_nRT]));
+ 		m_codeGen->Store64AtRefIdx(1);
+diff --git a/Source/MA_MIPSIV_Templates.cpp b/Source/MA_MIPSIV_Templates.cpp
+index 82091427..c416023c 100644
+--- a/Source/MA_MIPSIV_Templates.cpp
++++ b/Source/MA_MIPSIV_Templates.cpp
+@@ -137,12 +137,12 @@ void CMA_MIPSIV::Template_Store32Idx(const MemoryAccessIdxTraits& traits)
+ 
+ 	if(usePageLookup)
+ 	{
+-		ComputeMemAccessPageRef();
++		ComputeMemAccessPageRef(true);
+ 
+ 		m_codeGen->PushCst(0);
+ 		m_codeGen->BeginIf(Jitter::CONDITION_NE);
+ 		{
+-			ComputeMemAccessRefIdx(traits.elementSize);
++			ComputeMemAccessRefIdx(traits.elementSize, true);
+ 
+ 			m_codeGen->PushRel(offsetof(CMIPS, m_State.nGPR[m_nRT].nV[0]));
+ 			((m_codeGen)->*(traits.storeFunction))(1);
+diff --git a/Source/MIPS.cpp b/Source/MIPS.cpp
+index ae2324fc..dc0e0b93 100644
+--- a/Source/MIPS.cpp
++++ b/Source/MIPS.cpp
+@@ -30,9 +30,11 @@ CMIPS::CMIPS(MEMORYMAP_ENDIANNESS endianness, bool usePageTable)
+ 	{
+ 		const uint32 pageCount = 0x100000000ULL / MIPS_PAGE_SIZE;
+ 		m_pageLookup = new void*[pageCount];
++		m_pageLookupWrite = new void*[pageCount];
+ 		for(uint32 i = 0; i < pageCount; i++)
+ 		{
+ 			m_pageLookup[i] = nullptr;
++			m_pageLookupWrite[i] = nullptr;
+ 		}
+ 	}
+ 
+@@ -49,6 +51,7 @@ CMIPS::~CMIPS()
+ 	delete m_pMemoryMap;
+ 	delete m_analysis;
+ 	delete[] m_pageLookup;
++	delete[] m_pageLookupWrite;
+ }
+ 
+ void CMIPS::Reset()
+@@ -158,5 +161,6 @@ void CMIPS::MapPages(uint32 vAddress, uint32 size, uint8* memory)
+ 	for(uint32 pageIndex = 0; pageIndex < (size / MIPS_PAGE_SIZE); pageIndex++)
+ 	{
+ 		m_pageLookup[pageBase + pageIndex] = memory + (MIPS_PAGE_SIZE * pageIndex);
++		m_pageLookupWrite[pageBase + pageIndex] = memory + (MIPS_PAGE_SIZE * pageIndex);
+ 	}
+ }
+diff --git a/Source/MIPS.h b/Source/MIPS.h
+index fc28a8f9..ecc9ad6f 100644
+--- a/Source/MIPS.h
++++ b/Source/MIPS.h
+@@ -170,6 +170,13 @@ public:
+ 
+ 	void* m_vuMem = nullptr;
+ 	void** m_pageLookup = nullptr;
++	//Page table used by JIT stores. Same as m_pageLookup unless pages are write protected in
++	//software (WebAssembly has no mprotect): a null entry sends the store through the slow path.
++	void** m_pageLookupWrite = nullptr;
++
++	//Called by the slow path store proxies with the physical address and size written
++	typedef void (*WriteWatchHandler)(CMIPS*, uint32, uint32);
++	WriteWatchHandler m_writeWatchHandler = nullptr;
+ 
+ 	std::function<void(CMIPS*)> m_emptyBlockHandler;
+ 
+diff --git a/Source/MIPSInstructionFactory.cpp b/Source/MIPSInstructionFactory.cpp
+index 9ef01346..5ada9b26 100644
+--- a/Source/MIPSInstructionFactory.cpp
++++ b/Source/MIPSInstructionFactory.cpp
+@@ -137,9 +137,9 @@ void CMIPSInstructionFactory::ComputeMemAccessAddrNoXlat()
+ 	}
+ }
+ 
+-void CMIPSInstructionFactory::ComputeMemAccessRefIdx(uint32 accessSize)
++void CMIPSInstructionFactory::ComputeMemAccessRefIdx(uint32 accessSize, bool forWrite)
+ {
+-	ComputeMemAccessPageRef();
++	ComputeMemAccessPageRef(forWrite);
+ 
+ 	auto rs = static_cast<uint8>((m_nOpcode >> 21) & 0x001F);
+ 	auto immediate = static_cast<uint16>((m_nOpcode >> 0) & 0xFFFF);
+@@ -151,12 +151,12 @@ void CMIPSInstructionFactory::ComputeMemAccessRefIdx(uint32 accessSize)
+ 	m_codeGen->And();
+ }
+ 
+-void CMIPSInstructionFactory::ComputeMemAccessPageRef()
++void CMIPSInstructionFactory::ComputeMemAccessPageRef(bool forWrite)
+ {
+ 	auto rs = static_cast<uint8>((m_nOpcode >> 21) & 0x001F);
+ 	auto immediate = static_cast<int16>((m_nOpcode >> 0) & 0xFFFF);
+ 	constexpr int32 pageSizeShift = Framework::GetPowerOf2(MIPS_PAGE_SIZE);
+-	m_codeGen->PushRelRef(offsetof(CMIPS, m_pageLookup));
++	m_codeGen->PushRelRef(forWrite ? offsetof(CMIPS, m_pageLookupWrite) : offsetof(CMIPS, m_pageLookup));
+ 
+ 	m_codeGen->PushRel(offsetof(CMIPS, m_State.nGPR[rs].nV[0]));
+ 	m_codeGen->PushCst(immediate);
+diff --git a/Source/MIPSInstructionFactory.h b/Source/MIPSInstructionFactory.h
+index 4a12b345..a50ef851 100644
+--- a/Source/MIPSInstructionFactory.h
++++ b/Source/MIPSInstructionFactory.h
+@@ -30,8 +30,8 @@ public:
+ protected:
+ 	void ComputeMemAccessAddr();
+ 	void ComputeMemAccessAddrNoXlat();
+-	void ComputeMemAccessRefIdx(uint32);
+-	void ComputeMemAccessPageRef();
++	void ComputeMemAccessRefIdx(uint32, bool forWrite = false);
++	void ComputeMemAccessPageRef(bool forWrite = false);
+ 
+ 	void CheckTLBExceptions(bool);
+ 	void CheckTrap();
+diff --git a/Source/MemoryUtils.cpp b/Source/MemoryUtils.cpp
+index a152ce21..3a3e6999 100644
+--- a/Source/MemoryUtils.cpp
++++ b/Source/MemoryUtils.cpp
+@@ -86,24 +86,28 @@ uint128 MemoryUtils_GetQuadProxy(CMIPS* context, uint32 vAddress)
+ void MemoryUtils_SetByteProxy(CMIPS* context, uint32 value, uint32 vAddress)
+ {
+ 	uint32 address = context->m_pAddrTranslator(context, vAddress);
++	if(context->m_writeWatchHandler) context->m_writeWatchHandler(context, address, 1);
+ 	context->m_pMemoryMap->SetByte(address, static_cast<uint8>(value));
+ }
+ 
+ void MemoryUtils_SetHalfProxy(CMIPS* context, uint32 value, uint32 vAddress)
+ {
+ 	uint32 address = context->m_pAddrTranslator(context, vAddress);
++	if(context->m_writeWatchHandler) context->m_writeWatchHandler(context, address, 2);
+ 	context->m_pMemoryMap->SetHalf(address, static_cast<uint16>(value));
+ }
+ 
+ void MemoryUtils_SetWordProxy(CMIPS* context, uint32 value, uint32 vAddress)
+ {
+ 	uint32 address = context->m_pAddrTranslator(context, vAddress);
++	if(context->m_writeWatchHandler) context->m_writeWatchHandler(context, address, 4);
+ 	context->m_pMemoryMap->SetWord(address, value);
+ }
+ 
+ void MemoryUtils_SetDoubleProxy(CMIPS* context, uint64 value64, uint32 vAddress)
+ {
+ 	uint32 address = context->m_pAddrTranslator(context, vAddress);
++	if(context->m_writeWatchHandler) context->m_writeWatchHandler(context, address, 8);
+ 	assert((address & 0x07) == 0);
+ 	INTEGER64 value;
+ 	value.q = value64;
+@@ -135,6 +139,7 @@ void MemoryUtils_SetQuadProxy(CMIPS* context, const uint128& value, uint32 vAddr
+ {
+ 	uint32 address = context->m_pAddrTranslator(context, vAddress);
+ 	address &= ~0x0F;
++	if(context->m_writeWatchHandler) context->m_writeWatchHandler(context, address, 16);
+ 	auto e = context->m_pMemoryMap->GetWriteMap(address);
+ 	if(!e)
+ 	{
+diff --git a/Source/PS2VM.cpp b/Source/PS2VM.cpp
+index 5c8ded91..26853aad 100644
+--- a/Source/PS2VM.cpp
++++ b/Source/PS2VM.cpp
+@@ -59,6 +59,7 @@ CPS2VM::CPS2VM()
+     , m_spuProfilerZone(CProfiler::GetInstance().RegisterZone("SPU"))
+     , m_gsSyncProfilerZone(CProfiler::GetInstance().RegisterZone("GSSYNC"))
+     , m_otherProfilerZone(CProfiler::GetInstance().RegisterZone("OTHER"))
++    , m_limiterProfilerZone(CProfiler::GetInstance().RegisterZone("LIMITER"))
+ {
+ 	// clang-format off
+ 	static const std::pair<const char*, const char*> basicDirectorySettings[] =
+@@ -713,6 +714,11 @@ void CPS2VM::DestroySoundHandlerImpl()
+ 	m_soundHandler = nullptr;
+ }
+ 
++#ifdef PROFILE
++std::atomic<uint32> g_eeSlices;
++std::atomic<uint32> g_eeIdleSlices;
++#endif
++
+ void CPS2VM::UpdateEe()
+ {
+ #ifdef PROFILE
+@@ -722,8 +728,14 @@ void CPS2VM::UpdateEe()
+ 	while(m_eeExecutionTicks > 0)
+ 	{
+ 		int executed = m_ee->ExecuteCpu(m_singleStepEe ? 1 : m_eeExecutionTicks);
++#ifdef PROFILE
++		g_eeSlices++;
++#endif
+ 		if(m_ee->IsCpuIdle())
+ 		{
++#ifdef PROFILE
++			g_eeIdleSlices++;
++#endif
+ 			m_cpuUtilisation.eeIdleTicks += (m_eeExecutionTicks - executed);
+ 			executed = m_eeExecutionTicks;
+ 		}
+@@ -734,7 +746,13 @@ void CPS2VM::UpdateEe()
+ 
+ 		m_eeExecutionTicks -= executed;
+ 		m_spuUpdateTicks -= (static_cast<int64>(executed) << SPU_UPDATE_TICKS_PRECISION);
+-		m_ee->CountTicks(executed);
++		{
++#ifdef PROFILE
++			static const auto ticksZone = CProfiler::GetInstance().RegisterZone("EETICKS");
++			CProfilerZone profilerZone(ticksZone);
++#endif
++			m_ee->CountTicks(executed);
++		}
+ 		m_hblankTicks -= executed;
+ 		m_vblankTicks -= executed;
+ 
+@@ -900,6 +918,10 @@ void CPS2VM::EmuThread()
+ 	fesetround(FE_TOWARDZERO);
+ 	FpUtils::SetDenormalHandlingMode();
+ 	CProfiler::GetInstance().SetWorkThread();
++#ifdef PROFILE
++	CProfiler::GetInstance().SetPcSampler(0, CProfiler::GetInstance().RegisterZone("EEBLOCK"), &m_ee->m_EE.m_State.nPC);
++	CProfiler::GetInstance().SetPcSampler(1, m_iopProfilerZone, &m_iop->m_cpu.m_State.nPC);
++#endif
+ #ifdef __ANDROID__
+ 	JNIEnv* env = nullptr;
+ 	Framework::CJavaVM::AttachCurrentThread(&env, THREAD_NAME);
+@@ -979,7 +1001,12 @@ void CPS2VM::EmuThread()
+ 						{
+ 							m_ee->m_gs->ResetVBlank();
+ 						}
+-						m_frameLimiter.EndFrame();
++						{
++#ifdef PROFILE
++							CProfilerZone profilerZone(m_limiterProfilerZone);
++#endif
++							m_frameLimiter.EndFrame();
++						}
+ 						m_frameLimiter.BeginFrame();
+ 					}
+ 				}
+diff --git a/Source/PS2VM.h b/Source/PS2VM.h
+index c4f8be0c..ce79a2d1 100644
+--- a/Source/PS2VM.h
++++ b/Source/PS2VM.h
+@@ -2,6 +2,7 @@
+ 
+ #include <thread>
+ #include <future>
++#include <unordered_map>
+ #include "filesystem_def.h"
+ #include "Types.h"
+ #include "MIPS.h"
+@@ -202,6 +203,7 @@ private:
+ 	CProfiler::ZoneHandle m_spuProfilerZone = 0;
+ 	CProfiler::ZoneHandle m_gsSyncProfilerZone = 0;
+ 	CProfiler::ZoneHandle m_otherProfilerZone = 0;
++	CProfiler::ZoneHandle m_limiterProfilerZone = 0;
+ 
+ 	CPS2OS::RequestLoadExecutableEvent::Connection m_OnRequestLoadExecutableConnection;
+ 	Framework::CSignal<void()>::Connection m_OnExecutableChangeConnection;
+diff --git a/Source/Profiler.cpp b/Source/Profiler.cpp
+index daba0664..30c92159 100644
+--- a/Source/Profiler.cpp
++++ b/Source/Profiler.cpp
+@@ -1,20 +1,19 @@
+ #include "Profiler.h"
+ 
+ #include <cassert>
++#include <cstdarg>
++#include <cstdio>
+ 
+ CProfiler::ZoneHandle CProfiler::RegisterZone(const char* name)
+ {
+ #ifdef PROFILE
+-	for(unsigned int i = 0; i < m_zones.size(); i++)
++	for(unsigned int i = 0; i < m_zoneNames.size(); i++)
+ 	{
+-		const auto& zone(m_zones[i]);
+-		if(zone.name == name) return i;
++		if(m_zoneNames[i] == name) return i;
+ 	}
+-	auto newZone = ZONE();
+-	newZone.name = name;
+-	newZone.totalTime = 0;
+-	m_zones.push_back(newZone);
+-	return static_cast<CProfiler::ZoneHandle>(m_zones.size() - 1);
++	assert(m_zoneNames.size() < MAX_ZONES);
++	m_zoneNames.push_back(name);
++	return static_cast<CProfiler::ZoneHandle>(m_zoneNames.size() - 1);
+ #else
+ 	return 0;
+ #endif
+@@ -22,71 +21,91 @@ CProfiler::ZoneHandle CProfiler::RegisterZone(const char* name)
+ 
+ void CProfiler::CountCurrentZone()
+ {
+-	assert(std::this_thread::get_id() == m_workThreadId);
+-	assert(!m_zoneStack.empty());
+-
+-	auto thisTime = std::chrono::high_resolution_clock::now();
+-
+-	{
+-		auto topZoneHandle = m_zoneStack.top();
+-		auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(thisTime - m_currentTime);
+-		AddTimeToZone(topZoneHandle, duration.count());
+-	}
+-
+-	m_currentTime = thisTime;
+ }
+ 
+ void CProfiler::EnterZone(ZoneHandle zoneHandle)
+ {
+-	assert(std::this_thread::get_id() == m_workThreadId);
+-
+-	auto thisTime = std::chrono::high_resolution_clock::now();
+-
+-	if(!m_zoneStack.empty())
+-	{
+-		auto topZoneHandle = m_zoneStack.top();
+-		auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(thisTime - m_currentTime);
+-		AddTimeToZone(topZoneHandle, duration.count());
+-	}
+-
+ 	m_zoneStack.push(zoneHandle);
+-
+-	m_currentTime = thisTime;
++	m_currentZone.store(zoneHandle, std::memory_order_relaxed);
+ }
+ 
+ void CProfiler::ExitZone()
+ {
+-	CountCurrentZone();
+ 	m_zoneStack.pop();
++	m_currentZone.store(m_zoneStack.empty() ? -1 : m_zoneStack.top(), std::memory_order_relaxed);
+ }
+ 
+ CProfiler::ZoneArray CProfiler::GetStats() const
+ {
+-	assert(std::this_thread::get_id() == m_workThreadId);
+-	return m_zones;
++	ZoneArray result;
++	for(unsigned int i = 0; i < m_zoneNames.size(); i++)
++	{
++		ZONE zone;
++		zone.name = m_zoneNames[i];
++		zone.totalTime = m_zoneTimes[i].load(std::memory_order_relaxed);
++		result.push_back(zone);
++	}
++	return result;
+ }
+ 
+ void CProfiler::Reset()
+ {
+-	assert(std::this_thread::get_id() == m_workThreadId);
+-	for(auto& zone : m_zones)
++	for(auto& zoneTime : m_zoneTimes)
+ 	{
+-		zone.totalTime = 0;
++		zoneTime.store(0, std::memory_order_relaxed);
+ 	}
+ }
+ 
+ void CProfiler::SetWorkThread()
+ {
+-#ifndef NDEBUG
+ 	m_workThreadId = std::this_thread::get_id();
++#ifdef PROFILE
++	if(!m_samplerThread.joinable())
++	{
++		m_samplerThread = std::thread([this]() { SamplerThreadProc(); });
++		m_samplerThread.detach();
++	}
+ #endif
+ }
+ 
+-void CProfiler::AddTimeToZone(ZoneHandle zoneHandle, uint64 timeNs)
++void CProfiler::SetPcSampler(unsigned int slot, ZoneHandle zone, const uint32* pc)
++{
++	assert(slot < MAX_PC_SAMPLERS);
++	m_pcSamplers[slot].pc = pc;
++	m_pcSamplers[slot].zone = zone;
++}
++
++CProfiler::PcHistogram CProfiler::TakePcHistogram(unsigned int slot)
+ {
+-	assert(m_zones.size() > zoneHandle);
+-	auto& zone = m_zones[zoneHandle];
+-	zone.totalTime += timeNs;
++	assert(slot < MAX_PC_SAMPLERS);
++	std::lock_guard<std::mutex> lock(m_pcSamplersMutex);
++	PcHistogram result;
++	std::swap(result, m_pcSamplers[slot].histogram);
++	return result;
++}
++
++void CProfiler::SamplerThreadProc()
++{
++	auto lastTime = std::chrono::steady_clock::now();
++	while(1)
++	{
++		std::this_thread::sleep_for(std::chrono::microseconds(500));
++		auto thisTime = std::chrono::steady_clock::now();
++		uint64 elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(thisTime - lastTime).count();
++		lastTime = thisTime;
++		int32 zone = m_currentZone.load(std::memory_order_relaxed);
++		if(zone < 0 || zone >= MAX_ZONES) continue;
++		m_zoneTimes[zone].fetch_add(elapsed, std::memory_order_relaxed);
++		for(auto& sampler : m_pcSamplers)
++		{
++			auto pc = sampler.pc.load();
++			if(sampler.zone == zone && pc)
++			{
++				std::lock_guard<std::mutex> lock(m_pcSamplersMutex);
++				sampler.histogram[*pc]++;
++			}
++		}
++	}
+ }
+ 
+ //////////////////////////////////////////////////////////////////////////
+@@ -95,13 +114,33 @@ void CProfiler::AddTimeToZone(ZoneHandle zoneHandle, uint64 timeNs)
+ CProfilerZone::CProfilerZone(CProfiler::ZoneHandle handle)
+ {
+ #ifdef PROFILE
+-	CProfiler::GetInstance().EnterZone(handle);
++	m_active = CProfiler::GetInstance().IsWorkThread();
++	if(m_active) CProfiler::GetInstance().EnterZone(handle);
+ #endif
+ }
+ 
+ CProfilerZone::~CProfilerZone()
+ {
+ #ifdef PROFILE
+-	CProfiler::GetInstance().ExitZone();
++	if(m_active) CProfiler::GetInstance().ExitZone();
+ #endif
+ }
++
++void CProfiler::Log(const char* format, ...)
++{
++	char buffer[2048];
++	va_list args;
++	va_start(args, format);
++	vsnprintf(buffer, sizeof(buffer), format, args);
++	va_end(args);
++	std::lock_guard<std::mutex> lock(m_logMutex);
++	if(m_log.size() < 65536) m_log += buffer;
++}
++
++std::string CProfiler::TakeLog()
++{
++	std::lock_guard<std::mutex> lock(m_logMutex);
++	std::string result;
++	std::swap(result, m_log);
++	return result;
++}
+diff --git a/Source/Profiler.h b/Source/Profiler.h
+index 95d7439e..13d28982 100644
+--- a/Source/Profiler.h
++++ b/Source/Profiler.h
+@@ -5,14 +5,26 @@
+ #include <thread>
+ #include <vector>
+ #include <chrono>
++#include <atomic>
++#include <mutex>
++#include <unordered_map>
+ #include "Singleton.h"
+ #include "Types.h"
+ 
++//Sampling profiler: the work thread only publishes its current zone (two stores per zone
++//enter/exit), a sampler thread attributes elapsed time to that zone every ~0.5 ms.
++//Timing every zone transition was too expensive on WebAssembly (clock reads are JS calls).
+ class CProfiler : public CSingleton<CProfiler>
+ {
+ public:
+ 	typedef uint32 ZoneHandle;
+ 
++	enum
++	{
++		MAX_ZONES = 64,
++		MAX_PC_SAMPLERS = 2,
++	};
++
+ 	struct ZONE
+ 	{
+ 		std::string name;
+@@ -20,7 +32,7 @@ public:
+ 	};
+ 
+ 	typedef std::vector<ZONE> ZoneArray;
+-	typedef std::chrono::high_resolution_clock::time_point TimePoint;
++	typedef std::unordered_map<uint32, uint32> PcHistogram;
+ 
+ 	virtual ~CProfiler() = default;
+ 
+@@ -36,18 +48,47 @@ public:
+ 
+ 	void SetWorkThread();
+ 
++	//While the work thread is in 'zone', the sampler also records '*pc' in histogram 'slot'.
++	void SetPcSampler(unsigned int slot, ZoneHandle zone, const uint32* pc);
++	PcHistogram TakePcHistogram(unsigned int slot);
++
++	//Free-form debug log (any thread), drained by the frontend
++	void Log(const char*, ...);
++	std::string TakeLog();
++
++	//Cheap zone switch for very hot paths (work thread only, no stack bookkeeping)
++	int32 SwapCurrentZone(int32 zone)
++	{
++		return m_currentZone.exchange(zone, std::memory_order_relaxed);
++	}
++
++	bool IsWorkThread() const
++	{
++		return std::this_thread::get_id() == m_workThreadId;
++	}
++
+ private:
+-	typedef std::stack<ZoneHandle> ZoneStack;
++	void SamplerThreadProc();
+ 
+-	void AddTimeToZone(ZoneHandle, uint64);
++	std::vector<std::string> m_zoneNames;
++	std::atomic<uint64> m_zoneTimes[MAX_ZONES] = {};
++	std::stack<ZoneHandle> m_zoneStack;
++	std::atomic<int32> m_currentZone = -1;
+ 
+-	ZoneArray m_zones;
+-	ZoneStack m_zoneStack;
+-	TimePoint m_currentTime;
++	struct PC_SAMPLER
++	{
++		std::atomic<int32> zone = -1;
++		std::atomic<const uint32*> pc = nullptr;
++		PcHistogram histogram;
++	};
++	PC_SAMPLER m_pcSamplers[MAX_PC_SAMPLERS];
++	std::mutex m_pcSamplersMutex;
++
++	std::mutex m_logMutex;
++	std::string m_log;
+ 
+-#ifndef NDEBUG
+ 	std::thread::id m_workThreadId;
+-#endif
++	std::thread m_samplerThread;
+ };
+ 
+ class CProfilerZone
+@@ -55,4 +96,7 @@ class CProfilerZone
+ public:
+ 	CProfilerZone(CProfiler::ZoneHandle);
+ 	~CProfilerZone();
++
++private:
++	bool m_active = false;
+ };
+diff --git a/Source/ee/COP_VU.cpp b/Source/ee/COP_VU.cpp
+index e6c36f88..0a3afae7 100644
+--- a/Source/ee/COP_VU.cpp
++++ b/Source/ee/COP_VU.cpp
+@@ -114,12 +114,12 @@ void CCOP_VU::LQC2()
+ //3E
+ void CCOP_VU::SQC2()
+ {
+-	ComputeMemAccessPageRef();
++	ComputeMemAccessPageRef(true);
+ 
+ 	m_codeGen->PushCst(0);
+ 	m_codeGen->BeginIf(Jitter::CONDITION_NE);
+ 	{
+-		ComputeMemAccessRefIdx(0x10);
++		ComputeMemAccessRefIdx(0x10, true);
+ 
+ 		m_codeGen->MD_PushRel(offsetof(CMIPS, m_State.nCOP2[m_nFT]));
+ 		m_codeGen->MD_StoreAtRefIdx(1);
+diff --git a/Source/ee/DMAC.cpp b/Source/ee/DMAC.cpp
+index 1ad667fd..5a0d9294 100644
+--- a/Source/ee/DMAC.cpp
++++ b/Source/ee/DMAC.cpp
+@@ -1,4 +1,5 @@
+ #include <cstring>
++#include "EeExecutor.h"
+ #include <stdio.h>
+ #include "DMAC.h"
+ #include "../Ps2Const.h"
+@@ -210,6 +211,10 @@ uint32 CDMAC::ResumeDMA3(const void* pBuffer, uint32 nSize)
+ 	}
+ 
+ 	memcpy(pDst, pBuffer, nSize * 0x10);
++	if(pDst != m_spr + (m_D3_MADR & (PS2::EE_SPR_SIZE - 1)))
++	{
++		CEeExecutor::NotifyRamWritten(m_D3_MADR & (PS2::EE_RAM_SIZE - 1), nSize * 0x10);
++	}
+ 
+ 	m_D3_MADR += (nSize * 0x10);
+ 	m_D3_QWC -= nSize;
+@@ -297,6 +302,10 @@ uint32 CDMAC::ReceiveDMA8(uint32 nDstAddress, uint32 nCount, uint32 unused, bool
+ 		uint32 remainSpr = (PS2::EE_SPR_SIZE - m_D8_SADR) / 0x10;
+ 		uint32 copySize = std::min<uint32>(remainSpr, remainTransfer);
+ 		memcpy(dstPtr + nDstAddress, m_spr + m_D8_SADR, copySize * 0x10);
++		if(dstPtr == m_ram)
++		{
++			CEeExecutor::NotifyRamWritten(nDstAddress, copySize * 0x10);
++		}
+ 
+ 		remainTransfer -= copySize;
+ 		nDstAddress += (copySize * 0x10);
+diff --git a/Source/ee/EeBasicBlock.cpp b/Source/ee/EeBasicBlock.cpp
+index cb057bc3..b80770f0 100644
+--- a/Source/ee/EeBasicBlock.cpp
++++ b/Source/ee/EeBasicBlock.cpp
+@@ -4,11 +4,13 @@
+ void CEeBasicBlock::SetFpRoundingMode(Jitter::CJitter::ROUNDINGMODE fpRoundingMode)
+ {
+ 	m_fpRoundingMode = fpRoundingMode;
++	AddCacheVariant((static_cast<uint32>(fpRoundingMode) + 1) << 8);
+ }
+ 
+ void CEeBasicBlock::SetIsIdleLoopBlock()
+ {
+ 	m_isIdleLoopBlock = true;
++	AddCacheVariant(1 << 16);
+ }
+ 
+ void CEeBasicBlock::CompileProlog(CMipsJitter* jitter)
+diff --git a/Source/ee/EeExecutor.cpp b/Source/ee/EeExecutor.cpp
+index c8c72f94..f004a1a3 100644
+--- a/Source/ee/EeExecutor.cpp
++++ b/Source/ee/EeExecutor.cpp
+@@ -4,6 +4,7 @@
+ #include "EeBasicBlock.h"
+ #include "MA_EE.h"
+ #include "xxhash.h"
++#include "../Profiler.h"
+ 
+ #if defined(__unix__) || defined(__ANDROID__) || defined(__APPLE__)
+ #include <sys/mman.h>
+@@ -43,8 +44,51 @@ CEeExecutor::CEeExecutor(CMIPS& context, uint8* ram)
+     , m_ram(ram)
+ {
+ 	m_pageSize = framework_getpagesize();
++#if defined(__EMSCRIPTEN__)
++	m_pageSize = MIPS_PAGE_SIZE;
++	m_protectedPages.resize(PS2::EE_RAM_SIZE / MIPS_PAGE_SIZE, 0);
++	m_context.m_writeWatchHandler = &CEeExecutor::WriteWatchHandler;
++#endif
++}
++
++#if defined(__EMSCRIPTEN__)
++
++int CEeExecutor::Execute(int cycles)
++{
++	m_executing = true;
++	int result = CGenericMipsExecutor::Execute(cycles);
++	m_executing = false;
++	return result;
++}
++
++void CEeExecutor::WriteWatchHandler(CMIPS* context, uint32 address, uint32 size)
++{
++	//Only called from JIT code (store slow path), so a block is executing
++	static_cast<CEeExecutor*>(context->m_executor.get())->InvalidateWrittenRange(address, size, true);
+ }
+ 
++void CEeExecutor::NotifyRamWritten(uint32 address, uint32 size)
++{
++	if(!g_eeExecutor) return;
++	g_eeExecutor->InvalidateWrittenRange(address, size, g_eeExecutor->m_executing);
++}
++
++void CEeExecutor::InvalidateWrittenRange(uint32 address, uint32 size, bool executing)
++{
++	if(size == 0) return;
++	if(address >= PS2::EE_RAM_SIZE) return;
++	uint32 end = std::min<uint32>(address + size, PS2::EE_RAM_SIZE);
++	for(uint32 page = address / MIPS_PAGE_SIZE; page <= (end - 1) / MIPS_PAGE_SIZE; page++)
++	{
++		if(m_protectedPages[page])
++		{
++			ClearActiveBlocksInRange(page * MIPS_PAGE_SIZE, (page + 1) * MIPS_PAGE_SIZE, executing);
++		}
++	}
++}
++
++#endif
++
+ void CEeExecutor::SetBlockFpRoundingModes(BlockFpRoundingModeMap blockFpRoundingModes)
+ {
+ 	m_blockFpRoundingModes = std::move(blockFpRoundingModes);
+@@ -258,7 +302,24 @@ void CEeExecutor::SetMemoryProtected(void* addr, size_t size, bool protect)
+ 	BOOL result = VirtualProtect(addr, size, protect ? PAGE_READONLY : PAGE_READWRITE, &oldProtect);
+ 	assert(result == TRUE);
+ #elif defined(__EMSCRIPTEN__)
+-	//Not supported on JavaScript/WebAssembly env
++	{
++		ptrdiff_t offset = reinterpret_cast<uint8*>(addr) - m_ram;
++		assert(offset >= 0 && (offset + size) <= PS2::EE_RAM_SIZE);
++		if(size == 0) return;
++		uint32 firstPage = static_cast<uint32>(offset) / MIPS_PAGE_SIZE;
++		uint32 lastPage = static_cast<uint32>(offset + size - 1) / MIPS_PAGE_SIZE;
++		static const uint32 mirrorBases[] = {0x00000000, 0x20000000, 0x30000000, 0x80000000};
++		for(uint32 page = firstPage; page <= lastPage; page++)
++		{
++			if(m_protectedPages[page] == protect) continue;
++			m_protectedPages[page] = protect;
++			void* pagePtr = protect ? nullptr : (m_ram + (page * MIPS_PAGE_SIZE));
++			for(uint32 mirrorBase : mirrorBases)
++			{
++				m_context.m_pageLookupWrite[(mirrorBase / MIPS_PAGE_SIZE) + page] = pagePtr;
++			}
++		}
++	}
+ #elif defined(__unix__) || defined(__ANDROID__) || defined(__APPLE__)
+ 	uintptr_t addrValue = reinterpret_cast<uintptr_t>(addr) & ~(m_pageSize - 1);
+ 	addr = reinterpret_cast<void*>(addrValue);
+diff --git a/Source/ee/EeExecutor.h b/Source/ee/EeExecutor.h
+index 0e8ab924..326945d6 100644
+--- a/Source/ee/EeExecutor.h
++++ b/Source/ee/EeExecutor.h
+@@ -1,5 +1,7 @@
+ #pragma once
+ 
++#include <vector>
++
+ #ifdef _WIN32
+ #define NOMINMAX
+ #include <Windows.h>
+@@ -40,6 +42,20 @@ public:
+ 
+ 	BasicBlockPtr BlockFactory(CMIPS&, uint32, uint32) override;
+ 
++#if defined(__EMSCRIPTEN__)
++	int Execute(int) override;
++
++	//Software write protection of code pages (no mprotect on WebAssembly): JIT stores to
++	//protected pages take the slow path (null write page table entry) and invalidate the
++	//blocks of that page, like the access fault handler does on desktop platforms.
++	//C++ code writing EE RAM directly (DMA, HLE IOP modules) must call NotifyRamWritten.
++	static void NotifyRamWritten(uint32 address, uint32 size);
++#else
++	static void NotifyRamWritten(uint32, uint32)
++	{
++	}
++#endif
++
+ private:
+ 	typedef std::map<CachedBlockKey, BasicBlockPtr> CachedBlockMap;
+ 	CachedBlockMap m_cachedBlocks;
+@@ -51,6 +67,14 @@ private:
+ 	uint8* m_ram = nullptr;
+ 	size_t m_pageSize = 0;
+ 
++#if defined(__EMSCRIPTEN__)
++	static void WriteWatchHandler(CMIPS*, uint32, uint32);
++	void InvalidateWrittenRange(uint32, uint32, bool);
++
++	std::vector<uint8> m_protectedPages;
++	bool m_executing = false;
++#endif
++
+ 	bool HandleAccessFault(intptr_t);
+ 	void SetMemoryProtected(void*, size_t, bool);
+ 
+diff --git a/Source/ee/Ee_IdleEvaluator.cpp b/Source/ee/Ee_IdleEvaluator.cpp
+index 815349b4..aeacd416 100644
+--- a/Source/ee/Ee_IdleEvaluator.cpp
++++ b/Source/ee/Ee_IdleEvaluator.cpp
+@@ -7,13 +7,15 @@ void CIdleEvaluator::Reset()
+ 	m_semaChecker.Reset();
+ 	m_selfThreadRotate.Reset();
+ 	m_threadRotateBounce.Reset();
++	m_tightRotate.Reset();
+ }
+ 
+ bool CIdleEvaluator::IsIdle() const
+ {
+ 	return m_semaChecker.m_isIdle ||
+ 	       m_selfThreadRotate.m_isIdle ||
+-	       m_threadRotateBounce.m_isIdle;
++	       m_threadRotateBounce.m_isIdle ||
++	       m_tightRotate.m_isIdle;
+ }
+ 
+ void CIdleEvaluator::NotifyEvent(EVENT eventType, uint32 arg0, uint32 arg1)
+@@ -21,6 +23,44 @@ void CIdleEvaluator::NotifyEvent(EVENT eventType, uint32 arg0, uint32 arg1)
+ 	m_semaChecker.NotifyEvent(eventType, arg0, arg1);
+ 	m_selfThreadRotate.NotifyEvent(eventType, arg0, arg1);
+ 	m_threadRotateBounce.NotifyEvent(eventType, arg0, arg1);
++	if(eventType == EVENT_INTERRUPT)
++	{
++		m_tightRotate.m_interrupted = true;
++	}
++	m_tightRotate.m_isIdle = false;
++}
++
++void CIdleEvaluator::NotifyRotateThreadReadyQueue(uint32 threadIdBefore, uint32 threadIdAfter, uint32 executedCycles)
++{
++	NotifyEvent(EVENT_ROTATETHREADREADYQUEUE, threadIdBefore, threadIdAfter);
++
++	auto& strategy = m_tightRotate;
++	uint32 elapsed = executedCycles - strategy.m_lastCycles;
++	strategy.m_lastCycles = executedCycles;
++	if(elapsed <= STRATEGY_TIGHTROTATE::TIGHT_CYCLES)
++	{
++		strategy.m_streak++;
++	}
++	else if(!strategy.m_interrupted)
++	{
++		//Real work happened since the last rotation (interrupt handler cycles don't count)
++		strategy.m_streak = 0;
++	}
++	strategy.m_interrupted = false;
++	strategy.m_isIdle = (strategy.m_streak >= STRATEGY_TIGHTROTATE::THRESHOLD);
++}
++
++void CIdleEvaluator::BeginExecution()
++{
++	m_tightRotate.m_isIdle = false;
++}
++
++void CIdleEvaluator::STRATEGY_TIGHTROTATE::Reset()
++{
++	m_lastCycles = 0;
++	m_streak = 0;
++	m_interrupted = false;
++	m_isIdle = false;
+ }
+ 
+ void CIdleEvaluator::STRATEGY_SEMACHECKER::Reset()
+diff --git a/Source/ee/Ee_IdleEvaluator.h b/Source/ee/Ee_IdleEvaluator.h
+index ee33c277..16c043e4 100644
+--- a/Source/ee/Ee_IdleEvaluator.h
++++ b/Source/ee/Ee_IdleEvaluator.h
+@@ -21,6 +21,12 @@ namespace Ee
+ 
+ 		void NotifyEvent(EVENT, uint32, uint32 = 0);
+ 
++		//Tight rotation detection: 'executedCycles' is the running count of EE cycles actually
++		//executed (idle-skipped cycles excluded). The resulting idle state only lasts until the
++		//next execution chunk starts (BeginExecution), so threads doing real work are never throttled.
++		void NotifyRotateThreadReadyQueue(uint32 threadIdBefore, uint32 threadIdAfter, uint32 executedCycles);
++		void BeginExecution();
++
+ 	private:
+ 		//For Shadow of the Colossus
+ 		struct STRATEGY_SEMACHECKER
+@@ -44,6 +50,26 @@ namespace Ee
+ 			bool m_isIdle = false;
+ 		} m_selfThreadRotate;
+ 
++		//For GTA San Andreas: threads at the same priority yielding to each other with
++		//RotateThreadReadyQueue (an idle spinner plus a thread polling a flag) while frequent
++		//interrupts keep resetting the other strategies' counters. Rotations a few cycles apart
++		//mean nothing else happens on the EE until an interrupt makes progress possible.
++		struct STRATEGY_TIGHTROTATE
++		{
++			enum
++			{
++				TIGHT_CYCLES = 256,
++				THRESHOLD = 16,
++			};
++
++			void Reset();
++
++			uint32 m_lastCycles = 0;
++			uint32 m_streak = 0;
++			bool m_interrupted = false;
++			bool m_isIdle = false;
++		} m_tightRotate;
++
+ 		//For Ys: Ark of Napishtim
+ 		struct STRATEGY_THREADROTATEBOUNCE
+ 		{
+diff --git a/Source/ee/Ee_SubSystem.cpp b/Source/ee/Ee_SubSystem.cpp
+index ba721952..0ebcef6e 100644
+--- a/Source/ee/Ee_SubSystem.cpp
++++ b/Source/ee/Ee_SubSystem.cpp
+@@ -1,4 +1,5 @@
+ #include "Ee_SubSystem.h"
++#include "../Profiler.h"
+ #include "EeExecutor.h"
+ #include "VuExecutor.h"
+ #include "AppConfig.h"
+@@ -250,7 +251,12 @@ int CSubSystem::ExecuteCpu(int quota)
+ 	}
+ 	else if(!m_EE.m_State.nHasException)
+ 	{
++#ifdef PROFILE
++		static const auto eeJitZone = CProfiler::GetInstance().RegisterZone("EEJIT");
++		CProfilerZone profilerZone(eeJitZone);
++#endif
+ 		executed = (quota - m_EE.m_executor->Execute(quota));
++		m_os->NotifyCpuExecution(executed);
+ 	}
+ 	if(m_EE.m_State.nHasException)
+ 	{
+@@ -771,6 +777,10 @@ void CSubSystem::HandleVu1AreaWrite(uint32 offset, uint32 value)
+ 
+ void CSubSystem::ExecuteIpu()
+ {
++#ifdef PROFILE
++	static const auto ipuZone = CProfiler::GetInstance().RegisterZone("IPU");
++	CProfilerZone profilerZone(ipuZone);
++#endif
+ 	m_dmac.ResumeDMA4();
+ 	while(m_ipu.WillExecuteCommand())
+ 	{
+diff --git a/Source/ee/IPU.cpp b/Source/ee/IPU.cpp
+index b8efa0af..a628dee0 100644
+--- a/Source/ee/IPU.cpp
++++ b/Source/ee/IPU.cpp
+@@ -5,6 +5,8 @@
+ #include <algorithm>
+ #include <exception>
+ #include <functional>
++#include <array>
++#include <cmath>
+ #include "maybe_unused.h"
+ #include "EndianUtils.h"
+ #include "IPU_MacroblockAddressIncrementTable.h"
+@@ -23,6 +25,7 @@
+ #include "idct/TrivialC.h"
+ #include "idct/IEEE1180.h"
+ #include "Log.h"
++#include "../Profiler.h"
+ #include "DMAC.h"
+ #include "INTC.h"
+ #include "Ps2Const.h"
+@@ -1311,6 +1314,63 @@ void CIPU::CBDECCommand::Initialize(CINFIFO* inFifo, COUTFIFO* outFifo, uint32 c
+ 	m_currentBlockIndex = 0;
+ }
+ 
++//Same separable transform as IDCT::CIEEE1180 (reference mpeg2decode IDCT), computed in
++//single precision with loops the compiler vectorizes (the double precision version was
++//the main cost of FMV decoding on WebAssembly). Results only differ on rare .5 rounding ties.
++static void FastIdct(const int16* input, int16* output)
++{
++#ifdef PROFILE
++	static const auto profilerZoneHandle = CProfiler::GetInstance().RegisterZone("IPU_IDCT");
++	CProfilerZone profilerZone(profilerZoneHandle);
++#endif
++	static const auto coefs = []() {
++		std::array<float, 64> result;
++		for(int freq = 0; freq < 8; freq++)
++		{
++			double scale = (freq == 0) ? sqrt(0.125) : 0.5;
++			for(int time = 0; time < 8; time++)
++			{
++				result[freq * 8 + time] = static_cast<float>(scale * cos((3.14159265358979323846 / 8.0) * freq * (time + 0.5)));
++			}
++		}
++		return result;
++	}();
++
++	float temp[64];
++	for(int i = 0; i < 8; i++)
++	{
++		float acc[8] = {};
++		for(int k = 0; k < 8; k++)
++		{
++			float value = input[8 * i + k];
++			for(int j = 0; j < 8; j++)
++			{
++				acc[j] += coefs[k * 8 + j] * value;
++			}
++		}
++		for(int j = 0; j < 8; j++)
++		{
++			temp[8 * i + j] = acc[j];
++		}
++	}
++	for(int i = 0; i < 8; i++)
++	{
++		float acc[8] = {};
++		for(int k = 0; k < 8; k++)
++		{
++			float coef = coefs[k * 8 + i];
++			for(int j = 0; j < 8; j++)
++			{
++				acc[j] += coef * temp[8 * k + j];
++			}
++		}
++		for(int j = 0; j < 8; j++)
++		{
++			output[8 * i + j] = static_cast<int16>(floorf(acc[j] + 0.5f));
++		}
++	}
++}
++
+ bool CIPU::CBDECCommand::Execute()
+ {
+ 	while(1)
+@@ -1408,7 +1468,7 @@ bool CIPU::CBDECCommand::Execute()
+ 
+ 			memcpy(blockTemp, blockInfo.block, sizeof(int16) * 0x40);
+ 
+-			IDCT::CIEEE1180::GetInstance()->Transform(blockTemp, blockInfo.block);
++			FastIdct(blockTemp, blockInfo.block);
+ 
+ 			m_state = STATE_DECODEBLOCK_GOTONEXT;
+ 		}
+@@ -1511,6 +1571,10 @@ void CIPU::CBDECCommand_ReadDct::Initialize(CINFIFO* fifo, int16* block, unsigne
+ 
+ bool CIPU::CBDECCommand_ReadDct::Execute()
+ {
++#ifdef PROFILE
++	static const auto profilerZoneHandle = CProfiler::GetInstance().RegisterZone("IPU_VLC");
++	CProfilerZone profilerZone(profilerZoneHandle);
++#endif
+ 	while(1)
+ 	{
+ 		switch(m_state)
+@@ -1916,6 +1980,10 @@ void CIPU::CCSCCommand::Initialize(CINFIFO* input, COUTFIFO* output, uint32 comm
+ 
+ bool CIPU::CCSCCommand::Execute()
+ {
++#ifdef PROFILE
++	static const auto profilerZoneHandle = CProfiler::GetInstance().RegisterZone("IPU_CSC");
++	CProfilerZone profilerZone(profilerZoneHandle);
++#endif
+ 	while(1)
+ 	{
+ 		switch(m_state)
+diff --git a/Source/ee/MA_EE.cpp b/Source/ee/MA_EE.cpp
+index 9c60d5d1..10756e12 100644
+--- a/Source/ee/MA_EE.cpp
++++ b/Source/ee/MA_EE.cpp
+@@ -153,12 +153,12 @@ void CMA_EE::LQ()
+ //1F
+ void CMA_EE::SQ()
+ {
+-	ComputeMemAccessPageRef();
++	ComputeMemAccessPageRef(true);
+ 
+ 	m_codeGen->PushCst(0);
+ 	m_codeGen->BeginIf(Jitter::CONDITION_NE);
+ 	{
+-		ComputeMemAccessRefIdx(0x10);
++		ComputeMemAccessRefIdx(0x10, true);
+ 
+ 		m_codeGen->MD_PushRel(offsetof(CMIPS, m_State.nGPR[m_nRT]));
+ 		m_codeGen->MD_StoreAtRefIdx(1);
+diff --git a/Source/ee/PS2OS.cpp b/Source/ee/PS2OS.cpp
+index 857855c3..439bf72d 100644
+--- a/Source/ee/PS2OS.cpp
++++ b/Source/ee/PS2OS.cpp
+@@ -1,9 +1,17 @@
++#include <atomic>
++#include "Types.h"
++#ifdef PROFILE
++std::atomic<uint32> g_eeSyscallCounts[0x100];
++std::atomic<uint32> g_eeInterruptCount;
++#endif
++
+ #include <cstring>
+ #include <stddef.h>
+ #include <stdlib.h>
+ #include <exception>
+ #include "string_format.h"
+ #include "PS2OS.h"
++#include "../Profiler.h"
+ #include "StdStream.h"
+ #include "StdStreamUtils.h"
+ #ifdef __ANDROID__
+@@ -281,6 +289,12 @@ void CPS2OS::Release()
+ 	UnloadExecutable();
+ }
+ 
++void CPS2OS::NotifyCpuExecution(uint32 executedCycles)
++{
++	m_executedCycles += executedCycles;
++	m_idleEvaluator.BeginExecution();
++}
++
+ bool CPS2OS::IsIdle() const
+ {
+ 	return m_ee.CanGenerateInterrupt() &&
+@@ -1366,6 +1380,9 @@ void CPS2OS::HandleInterrupt(int32 cpuIntLine)
+ 		return;
+ 	}
+ 
++#ifdef PROFILE
++	g_eeInterruptCount++;
++#endif
+ 	if(m_currentThreadId != m_idleThreadId)
+ 	{
+ 		auto thread = m_threads[m_currentThreadId];
+@@ -2223,7 +2240,7 @@ void CPS2OS::sc_RotateThreadReadyQueue()
+ 
+ 	ThreadShakeAndBake();
+ 
+-	m_idleEvaluator.NotifyEvent(Ee::CIdleEvaluator::EVENT_ROTATETHREADREADYQUEUE, threadIdBefore, m_currentThreadId);
++	m_idleEvaluator.NotifyRotateThreadReadyQueue(threadIdBefore, m_currentThreadId, m_executedCycles);
+ }
+ 
+ //2D/2E
+@@ -2881,6 +2898,12 @@ void CPS2OS::sc_GetCop0()
+ void CPS2OS::sc_FlushCache()
+ {
+ 	FRAMEWORK_MAYBE_UNUSED uint32 operationType = m_ee.m_State.nGPR[SC_PARAM0].nV[0];
++#ifdef PROFILE
++	if(operationType != 0)
++	{
++		CProfiler::GetInstance().Log("FlushCache(%d) from ra=%08X\n", operationType, m_ee.m_State.nGPR[CMIPS::RA].nV[0]);
++	}
++#endif
+ }
+ 
+ //70
+@@ -3214,6 +3237,9 @@ void CPS2OS::HandleSyscall()
+ 		}
+ 		//Save for custom handler
+ 		m_ee.m_State.nGPR[3].nV[0] = func;
++#ifdef PROFILE
++		g_eeSyscallCounts[func & 0xFF]++;
++#endif
+ 
+ 		if(GetCustomSyscallTable()[func] == 0)
+ 		{
+diff --git a/Source/ee/PS2OS.h b/Source/ee/PS2OS.h
+index 8dab3424..3f349b4f 100644
+--- a/Source/ee/PS2OS.h
++++ b/Source/ee/PS2OS.h
+@@ -33,6 +33,7 @@ public:
+ 	void Release();
+ 
+ 	bool IsIdle() const;
++	void NotifyCpuExecution(uint32);
+ 
+ 	void BootFromFile(const fs::path&);
+ 	void BootFromVirtualPath(const char*, const ArgumentList&);
+@@ -475,6 +476,7 @@ private:
+ 	//For display purposes only
+ 	std::string m_executableName;
+ 
++	uint32 m_executedCycles = 0;
+ 	Ee::CIdleEvaluator m_idleEvaluator;
+ 
+ #ifdef DEBUGGER_INCLUDED
+diff --git a/Source/ee/SIF.cpp b/Source/ee/SIF.cpp
+index 0a65c8a8..83f327ad 100644
+--- a/Source/ee/SIF.cpp
++++ b/Source/ee/SIF.cpp
+@@ -1,4 +1,5 @@
+ #include <cstring>
++#include "EeExecutor.h"
+ #include <stdio.h>
+ #include "Log.h"
+ #include "../Ps2Const.h"
+@@ -6,6 +7,7 @@
+ #include "../states/MemoryStateFile.h"
+ #include "../iop/IopBios.h"
+ #include "SIF.h"
++#include "../Profiler.h"
+ #include "lexical_cast_ex.h"
+ #include "string_format.h"
+ 
+@@ -284,6 +286,7 @@ void CSIF::MarkPacketProcessed()
+ void CSIF::SendDMA(const void* data, uint32 dstAddr, uint32 size)
+ {
+ 	memcpy(m_eeRam + dstAddr, data, size);
++	CEeExecutor::NotifyRamWritten(dstAddr, size);
+ 
+ 	uint32 qwc = (size + 0x0F) / 0x10;
+ 	m_dmac.SetRegister(CDMAC::D5_MADR, dstAddr);
+@@ -584,6 +587,7 @@ void CSIF::Cmd_Call(const SIFCMDHEADER* hdr)
+ 		                           reinterpret_cast<uint32*>(m_eeRam + m_nDataAddr), call->sendSize,
+ 		                           reinterpret_cast<uint32*>(m_eeRam + recvAddr), call->recvSize,
+ 		                           m_eeRam);
++		CEeExecutor::NotifyRamWritten(recvAddr, call->recvSize);
+ 	}
+ 	else
+ 	{
+@@ -635,6 +639,7 @@ void CSIF::Cmd_GetOtherData(const SIFCMDHEADER* hdr)
+ 	uint32 srcPtr = otherData->srcPtr & (PS2::IOP_RAM_SIZE - 1);
+ 
+ 	memcpy(m_eeRam + dstPtr, m_iopRam + srcPtr, otherData->size);
++	CEeExecutor::NotifyRamWritten(dstPtr, otherData->size);
+ 
+ 	{
+ 		SIFRPCREQUESTEND rend;
+@@ -670,6 +675,7 @@ void CSIF::SendCallReply(uint32 serverId, const void* returnData)
+ 		assert((requestInfo.call.recvSize & 0x03) == 0);
+ 		uint32 dstSize = (requestInfo.call.recvSize + 0x03) & ~0x03;
+ 		memcpy(m_eeRam + dstPtr, returnData, dstSize);
++		CEeExecutor::NotifyRamWritten(dstPtr, dstSize);
+ 	}
+ 	SendPacket(&requestInfo.reply, sizeof(SIFRPCREQUESTEND));
+ 	m_callReplies.erase(replyIterator);
+diff --git a/Source/ee/VuBasicBlock.cpp b/Source/ee/VuBasicBlock.cpp
+index a1ca3ca7..81d1b638 100644
+--- a/Source/ee/VuBasicBlock.cpp
++++ b/Source/ee/VuBasicBlock.cpp
+@@ -325,6 +325,8 @@ void CVuBasicBlock::CompileRange(CMipsJitter* jitter)
+ 		{
+ 			//Disable block linking because targets will be wrong
+ 			m_isLinkable = false;
++			//Compiles code outside of the block (branch target): keep it out of the persistent cache
++			m_cacheable = false;
+ 
+ 			assert(address >= 8);
+ 			uint32 branchOpcodeAddr = address - 8;
+@@ -348,6 +350,8 @@ void CVuBasicBlock::CompileRange(CMipsJitter* jitter)
+ 			uint32 branchOpcodeLo = m_context.m_pMemoryMap->GetInstruction(branchOpcodeAddr);
+ 			if(IsConditionalBranch(branchOpcodeLo))
+ 			{
++				//Compiles the instruction after the block: keep it out of the persistent cache
++				m_cacheable = false;
+ 				//So, this is a E bit in a delay slot. If branch is not taken
+ 				//we want to execute the instruction in the E bit delay slot.
+ 				jitter->PushRel(offsetof(CMIPS, m_State.nDelayedJumpAddr));
+diff --git a/Source/ee/VuExecutor.cpp b/Source/ee/VuExecutor.cpp
+index 72e80fc4..66f52804 100644
+--- a/Source/ee/VuExecutor.cpp
++++ b/Source/ee/VuExecutor.cpp
+@@ -71,6 +71,8 @@ BasicBlockPtr CVuExecutor::BlockFactory(CMIPS& context, uint32 begin, uint32 end
+ 
+ 	//Totally new block, build it from scratch
+ 	auto result = std::make_shared<CVuBasicBlock>(context, begin, end, m_blockCategory);
++	//VU0 and VU1 generate different code (memory address mask)
++	result->AddCacheVariant(m_maxAddress);
+ 
+ 	auto blockCompileHintsIterator = std::find_if(std::begin(g_blockCompileHints), std::end(g_blockCompileHints),
+ 	                                              [&](const auto& item) { return item.blockKey == blockKey; });
+diff --git a/Source/gs/GSHandler.cpp b/Source/gs/GSHandler.cpp
+index 57e58ba9..2befcf14 100644
+--- a/Source/gs/GSHandler.cpp
++++ b/Source/gs/GSHandler.cpp
+@@ -1,6 +1,9 @@
+ #include <stdio.h>
+ #include <string.h>
+ #include <functional>
++#include <atomic>
++#include <chrono>
++#include "../Profiler.h"
+ #include "AppConfig.h"
+ #include "Log.h"
+ #include "../states/MemoryStateFile.h"
+@@ -2171,15 +2174,25 @@ void CGSHandler::WriteToDelayedRegister(uint32 address, uint32 value, DELAYED_RE
+ 	}
+ }
+ 
++#ifdef PROFILE
++std::atomic<uint64> g_gsThreadBusyNs = 0;
++#endif
++
+ void CGSHandler::ThreadProc()
+ {
+ 	while(!m_threadDone)
+ 	{
+ 		m_mailBox.WaitForCall();
++#ifdef PROFILE
++		auto busyStart = std::chrono::steady_clock::now();
++#endif
+ 		while(m_mailBox.IsPending())
+ 		{
+ 			m_mailBox.ReceiveCall();
+ 		}
++#ifdef PROFILE
++		g_gsThreadBusyNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - busyStart).count();
++#endif
+ 	}
+ }
+ 
+@@ -2190,6 +2203,15 @@ void CGSHandler::SendGSCall(const CMailBox::FunctionType& function, bool waitFor
+ 		waitForCompletion = false;
+ 	}
+ 	waitForCompletion |= forceWaitForCompletion;
++#ifdef PROFILE
++	if(waitForCompletion)
++	{
++		static const auto gsWaitZone = CProfiler::GetInstance().RegisterZone("GSWAIT");
++		CProfilerZone profilerZone(gsWaitZone);
++		m_mailBox.SendCall(function, waitForCompletion);
++		return;
++	}
++#endif
+ 	m_mailBox.SendCall(function, waitForCompletion);
+ }
+ 
+diff --git a/Source/iop/Iop_Cdvdfsv.cpp b/Source/iop/Iop_Cdvdfsv.cpp
+index 57aa2dbd..7d795846 100644
+--- a/Source/iop/Iop_Cdvdfsv.cpp
++++ b/Source/iop/Iop_Cdvdfsv.cpp
+@@ -1,4 +1,5 @@
+ #include <assert.h>
++#include "../ee/EeExecutor.h"
+ #include "Log.h"
+ #include "../Ps2Const.h"
+ #include "Iop_Cdvdfsv.h"
+@@ -97,6 +98,7 @@ void CCdvdfsv::FinishPendingCommand()
+ 			{
+ 				fileSystem->ReadBlock(m_pendingReadSector + i, eeRam + (m_pendingReadAddr + (i * sectorSize)));
+ 			}
++			CEeExecutor::NotifyRamWritten(m_pendingReadAddr, m_pendingReadCount * sectorSize);
+ 		}
+ 	}
+ 	else if(m_pendingCommand == COMMAND_READIOP)
+@@ -120,6 +122,7 @@ void CCdvdfsv::FinishPendingCommand()
+ 				fileSystem->ReadBlock(m_streamPos, eeRam + (m_pendingReadAddr + (i * sectorSize)));
+ 				m_streamPos++;
+ 			}
++			CEeExecutor::NotifyRamWritten(m_pendingReadAddr, m_pendingReadCount * sectorSize);
+ 		}
+ 	}
+ 	else if(m_pendingCommand == COMMAND_NDISKREADY)
+diff --git a/Source/iop/Iop_FileIoHandler1000.cpp b/Source/iop/Iop_FileIoHandler1000.cpp
+index 8db6825d..31a41375 100644
+--- a/Source/iop/Iop_FileIoHandler1000.cpp
++++ b/Source/iop/Iop_FileIoHandler1000.cpp
+@@ -1,4 +1,5 @@
+ #include <cstring>
++#include "../ee/EeExecutor.h"
+ #include "Iop_FileIoHandler1000.h"
+ #include "Iop_Ioman.h"
+ #include "Iop_SifManPs2.h"
+@@ -194,6 +195,7 @@ std::pair<bool, int32> CFileIoHandler1000::FinishReadRequest(MODULEDATA* moduleD
+ 	else
+ 	{
+ 		memcpy(eeRam + moduleData->eeBufferAddr, moduleData->buffer, result);
++		CEeExecutor::NotifyRamWritten(moduleData->eeBufferAddr, result);
+ 		moduleData->bytesProcessed += result;
+ 		moduleData->eeBufferAddr += result;
+ 		moduleData->size -= result;
+diff --git a/Source/iop/Iop_FileIoHandler2200.cpp b/Source/iop/Iop_FileIoHandler2200.cpp
+index 4da4d3e1..42c159a4 100644
+--- a/Source/iop/Iop_FileIoHandler2200.cpp
++++ b/Source/iop/Iop_FileIoHandler2200.cpp
+@@ -1,4 +1,5 @@
+ #include <cassert>
++#include "../ee/EeExecutor.h"
+ #include <cstring>
+ #include "Iop_FileIoHandler2200.h"
+ #include "Iop_Ioman.h"
+@@ -202,6 +203,7 @@ uint32 CFileIoHandler2200::InvokeRead(uint32* args, uint32 argsSize, uint32* ret
+ 	auto command = reinterpret_cast<READCOMMAND*>(args);
+ 	uint32 readAddress = command->buffer & (PS2::EE_RAM_SIZE - 1);
+ 	auto result = m_ioman->Read(command->fd, command->size, reinterpret_cast<void*>(ram + readAddress));
++	CEeExecutor::NotifyRamWritten(readAddress, command->size);
+ 
+ 	READREPLY reply;
+ 	reply.header.commandId = COMMANDID_READ;
+@@ -531,6 +533,7 @@ void CFileIoHandler2200::SendPendingReply(uint8* ram)
+ 	if(m_resultPtr[0] != 0)
+ 	{
+ 		memcpy(ram + m_resultPtr[0], m_pendingReply.buffer.data(), m_pendingReply.replySize);
++		CEeExecutor::NotifyRamWritten(m_resultPtr[0], m_pendingReply.replySize);
+ 	}
+ 	SendSifReply();
+ 	m_pendingReply.valid = false;
+diff --git a/Source/iop/Iop_McServ.cpp b/Source/iop/Iop_McServ.cpp
+index 4ef78545..36f307fd 100644
+--- a/Source/iop/Iop_McServ.cpp
++++ b/Source/iop/Iop_McServ.cpp
+@@ -1,4 +1,5 @@
+ #include <assert.h>
++#include "../ee/EeExecutor.h"
+ #include <stdio.h>
+ #include <algorithm>
+ #include <cstring>
+@@ -1075,6 +1076,7 @@ void CMcServ::ProceedReadFast(CMIPS& context)
+ 	{
+ 		auto eeRam = sifManPs2->GetEeRam();
+ 		memcpy(eeRam + moduleData->readFastBufferAddress, cluster, readSize);
++		CEeExecutor::NotifyRamWritten(moduleData->readFastBufferAddress, readSize);
+ 	}
+ 
+ 	reinterpret_cast<uint32*>(moduleData->rpcBuffer)[3] = readSize;
+diff --git a/Source/iop/Iop_SifManPs2.cpp b/Source/iop/Iop_SifManPs2.cpp
+index e1b065c9..5c31850a 100644
+--- a/Source/iop/Iop_SifManPs2.cpp
++++ b/Source/iop/Iop_SifManPs2.cpp
+@@ -1,4 +1,5 @@
+ #include <cstring>
++#include "../ee/EeExecutor.h"
+ #include "Iop_SifManPs2.h"
+ #include "../Ps2Const.h"
+ 
+@@ -86,6 +87,7 @@ void CSifManPs2::ExecuteSifDma(uint32 structAddr, uint32 count)
+ 		{
+ 			uint8* dst = m_eeRam + dstAddr;
+ 			memcpy(dst, src, dmaReg.size);
++			CEeExecutor::NotifyRamWritten(dstAddr, dmaReg.size);
+ 		}
+ 	}
+ }
+diff --git a/Source/ui_js/CMakeLists.txt b/Source/ui_js/CMakeLists.txt
+index cf3518e4..948e07bf 100644
+--- a/Source/ui_js/CMakeLists.txt
++++ b/Source/ui_js/CMakeLists.txt
+@@ -62,8 +62,11 @@ target_link_options(Play PRIVATE "-sALLOW_TABLE_GROWTH")
+ target_link_options(Play PRIVATE "-sALLOW_MEMORY_GROWTH")
+ #target_link_options(Play PRIVATE "-sASSERTIONS=2")
+ target_link_options(Play PRIVATE "-sEXPORT_NAME=Play")
+-target_link_options(Play PRIVATE "-sPTHREAD_POOL_SIZE=2")
++target_link_options(Play PRIVATE "-sPTHREAD_POOL_SIZE=4")
+ target_link_options(Play PRIVATE "-sWASM_BIGINT")
+ target_link_options(Play PRIVATE "-sOFFSCREEN_FRAMEBUFFER=1")
+ target_link_options(Play PRIVATE "-sENVIRONMENT=web,worker")
+ target_link_options(Play PRIVATE "-sUSE_WEBGL2=1")
++#Per-game settings (idle loops, FP modes, patches) read by CGameConfig from the app resources path
++target_link_options(Play PRIVATE "--embed-file=${CMAKE_CURRENT_SOURCE_DIR}/../../GameConfig.xml@/usr/local/share/GameConfig.xml")
++set_property(TARGET Play APPEND PROPERTY LINK_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/../../GameConfig.xml)
+diff --git a/Source/ui_js/InputProviderEmscripten.cpp b/Source/ui_js/InputProviderEmscripten.cpp
+index 763bc0f8..6b861d56 100644
+--- a/Source/ui_js/InputProviderEmscripten.cpp
++++ b/Source/ui_js/InputProviderEmscripten.cpp
+@@ -1,38 +1,94 @@
+ #include "InputProviderEmscripten.h"
+-#include "string_format.h"
++#include <cmath>
++#include <algorithm>
++#include <cstring>
++#include <iterator>
++
++using PS2::CControllerInfo;
+ 
+ constexpr uint32 PROVIDER_ID = 'EmSc';
++constexpr double STICK_DEADZONE = 0.15;
++constexpr double TRIGGER_THRESHOLD = 0.3;
+ 
+-enum
++namespace
+ {
+-	INPUT_ARROW_UP = 0xFF80,
+-	INPUT_ARROW_DOWN,
+-	INPUT_ARROW_LEFT,
+-	INPUT_ARROW_RIGHT,
+-	INPUT_ENTER,
+-	INPUT_BACKSPACE,
+-	INPUT_SHIFT_RIGHT,
+-
+-	INPUT_KEY_A,
+-	INPUT_KEY_F,
+-	INPUT_KEY_G,
+-	INPUT_KEY_H,
+-	INPUT_KEY_I,
+-	INPUT_KEY_J,
+-	INPUT_KEY_K,
+-	INPUT_KEY_L,
+-	INPUT_KEY_S,
+-	INPUT_KEY_T,
+-	INPUT_KEY_X,
+-	INPUT_KEY_Z,
+-
+-	INPUT_KEY_0,
+-	INPUT_KEY_1,
+-	INPUT_KEY_2,
+-	INPUT_KEY_3,
+-	INPUT_KEY_8,
+-	INPUT_KEY_9,
+-};
++	struct KEYMAP
++	{
++		const char* code;
++		CControllerInfo::BUTTON button;
++		bool positive; // axes only: key pushes toward 0xFF (right/down)
++	};
++
++	// Same keys as the original Play! web build.
++	const KEYMAP g_keyMap[] =
++	    {
++	        {"Enter", CControllerInfo::START, false},
++	        {"Backspace", CControllerInfo::SELECT, false},
++	        {"ArrowLeft", CControllerInfo::DPAD_LEFT, false},
++	        {"ArrowRight", CControllerInfo::DPAD_RIGHT, false},
++	        {"ArrowUp", CControllerInfo::DPAD_UP, false},
++	        {"ArrowDown", CControllerInfo::DPAD_DOWN, false},
++	        {"KeyA", CControllerInfo::SQUARE, false},
++	        {"KeyZ", CControllerInfo::CROSS, false},
++	        {"KeyS", CControllerInfo::TRIANGLE, false},
++	        {"KeyX", CControllerInfo::CIRCLE, false},
++	        {"Key1", CControllerInfo::L1, false},
++	        {"Key2", CControllerInfo::L2, false},
++	        {"Key3", CControllerInfo::L3, false},
++	        {"Key8", CControllerInfo::R1, false},
++	        {"Key9", CControllerInfo::R2, false},
++	        {"Key0", CControllerInfo::R3, false},
++	        {"KeyF", CControllerInfo::ANALOG_LEFT_X, false},
++	        {"KeyH", CControllerInfo::ANALOG_LEFT_X, true},
++	        {"KeyT", CControllerInfo::ANALOG_LEFT_Y, false},
++	        {"KeyG", CControllerInfo::ANALOG_LEFT_Y, true},
++	        {"KeyJ", CControllerInfo::ANALOG_RIGHT_X, false},
++	        {"KeyL", CControllerInfo::ANALOG_RIGHT_X, true},
++	        {"KeyI", CControllerInfo::ANALOG_RIGHT_Y, false},
++	        {"KeyK", CControllerInfo::ANALOG_RIGHT_Y, true},
++	};
++
++	// W3C "standard" gamepad button index -> PS2 button.
++	const CControllerInfo::BUTTON g_padButtonMap[] =
++	    {
++	        CControllerInfo::CROSS,      // 0  A / Cross
++	        CControllerInfo::CIRCLE,     // 1  B / Circle
++	        CControllerInfo::SQUARE,     // 2  X / Square
++	        CControllerInfo::TRIANGLE,   // 3  Y / Triangle
++	        CControllerInfo::L1,         // 4  LB
++	        CControllerInfo::R1,         // 5  RB
++	        CControllerInfo::L2,         // 6  LT
++	        CControllerInfo::R2,         // 7  RT
++	        CControllerInfo::SELECT,     // 8  Back / Share
++	        CControllerInfo::START,      // 9  Start / Options
++	        CControllerInfo::L3,         // 10 left stick click
++	        CControllerInfo::R3,         // 11 right stick click
++	        CControllerInfo::DPAD_UP,    // 12
++	        CControllerInfo::DPAD_DOWN,  // 13
++	        CControllerInfo::DPAD_LEFT,  // 14
++	        CControllerInfo::DPAD_RIGHT, // 15
++	};
++
++	uint32 AxisToPs2(double v)
++	{
++		long value = std::lround(127.0 + v * 128.0);
++		return static_cast<uint32>(std::max(0L, std::min(255L, value)));
++	}
++
++	// Radial deadzone, rescaled so the stick still reaches full range.
++	void ReadStick(double x, double y, uint32& outX, uint32& outY)
++	{
++		double mag = std::sqrt(x * x + y * y);
++		if(mag < STICK_DEADZONE)
++		{
++			outX = outY = 0x7F;
++			return;
++		}
++		double scale = std::min(1.0, (mag - STICK_DEADZONE) / (1.0 - STICK_DEADZONE)) / mag;
++		outX = AxisToPs2(x * scale);
++		outY = AxisToPs2(y * scale);
++	}
++}
+ 
+ uint32 CInputProviderEmscripten::GetId() const
+ {
+@@ -41,73 +97,101 @@ uint32 CInputProviderEmscripten::GetId() const
+ 
+ std::string CInputProviderEmscripten::GetTargetDescription(const BINDINGTARGET& target) const
+ {
+-	return std::string();
++	return (target.keyId < CControllerInfo::MAX_BUTTONS) ? CControllerInfo::m_buttonName[target.keyId] : std::string();
+ }
+ 
+-BINDINGTARGET CInputProviderEmscripten::MakeBindingTarget(const EM_UTF8* code)
++BINDINGTARGET CInputProviderEmscripten::MakeBindingTarget(CControllerInfo::BUTTON button)
+ {
+-	uint32 keyCode = 0;
+-	if(!strcmp(code, "ArrowUp"))
+-		keyCode = INPUT_ARROW_UP;
+-	else if(!strcmp(code, "ArrowDown"))
+-		keyCode = INPUT_ARROW_DOWN;
+-	else if(!strcmp(code, "ArrowLeft"))
+-		keyCode = INPUT_ARROW_LEFT;
+-	else if(!strcmp(code, "ArrowRight"))
+-		keyCode = INPUT_ARROW_RIGHT;
+-	else if(!strcmp(code, "Enter"))
+-		keyCode = INPUT_ENTER;
+-	else if(!strcmp(code, "ShiftRight"))
+-		keyCode = INPUT_SHIFT_RIGHT;
+-	else if(!strcmp(code, "Backspace"))
+-		keyCode = INPUT_BACKSPACE;
+-	else if(!strcmp(code, "KeyA"))
+-		keyCode = INPUT_KEY_A;
+-	else if(!strcmp(code, "KeyF"))
+-		keyCode = INPUT_KEY_F;
+-	else if(!strcmp(code, "KeyG"))
+-		keyCode = INPUT_KEY_G;
+-	else if(!strcmp(code, "KeyH"))
+-		keyCode = INPUT_KEY_H;
+-	else if(!strcmp(code, "KeyI"))
+-		keyCode = INPUT_KEY_I;
+-	else if(!strcmp(code, "KeyJ"))
+-		keyCode = INPUT_KEY_J;
+-	else if(!strcmp(code, "KeyK"))
+-		keyCode = INPUT_KEY_K;
+-	else if(!strcmp(code, "KeyL"))
+-		keyCode = INPUT_KEY_L;
+-	else if(!strcmp(code, "KeyS"))
+-		keyCode = INPUT_KEY_S;
+-	else if(!strcmp(code, "KeyT"))
+-		keyCode = INPUT_KEY_T;
+-	else if(!strcmp(code, "KeyX"))
+-		keyCode = INPUT_KEY_X;
+-	else if(!strcmp(code, "KeyZ"))
+-		keyCode = INPUT_KEY_Z;
+-	else if(!strcmp(code, "Key0"))
+-		keyCode = INPUT_KEY_0;
+-	else if(!strcmp(code, "Key1"))
+-		keyCode = INPUT_KEY_1;
+-	else if(!strcmp(code, "Key2"))
+-		keyCode = INPUT_KEY_2;
+-	else if(!strcmp(code, "Key3"))
+-		keyCode = INPUT_KEY_3;
+-	else if(!strcmp(code, "Key8"))
+-		keyCode = INPUT_KEY_8;
+-	else if(!strcmp(code, "Key9"))
+-		keyCode = INPUT_KEY_9;
+-	else
+-		keyCode = code[0];
+-	return BINDINGTARGET(PROVIDER_ID, DeviceIdType{{0}}, keyCode, BINDINGTARGET::KEYTYPE::BUTTON);
++	auto keyType = CControllerInfo::IsAxis(button) ? BINDINGTARGET::KEYTYPE::AXIS : BINDINGTARGET::KEYTYPE::BUTTON;
++	return BINDINGTARGET(PROVIDER_ID, DeviceIdType{{0}}, button, keyType);
+ }
+ 
+ void CInputProviderEmscripten::OnKeyDown(const EM_UTF8* code)
+ {
+-	OnInput(MakeBindingTarget(code), 1);
++	OnKey(code, true);
+ }
+ 
+ void CInputProviderEmscripten::OnKeyUp(const EM_UTF8* code)
+ {
+-	OnInput(MakeBindingTarget(code), 0);
++	OnKey(code, false);
++}
++
++void CInputProviderEmscripten::OnKey(const EM_UTF8* code, bool pressed)
++{
++	for(const auto& key : g_keyMap)
++	{
++		if(strcmp(code, key.code)) continue;
++		(key.positive ? m_keyPos : m_keyNeg)[key.button] = pressed;
++		Publish(key.button);
++		return;
++	}
++}
++
++void CInputProviderEmscripten::PollGamepads()
++{
++	uint32 padValue[CControllerInfo::MAX_BUTTONS] = {0x7F, 0x7F, 0x7F, 0x7F};
++
++	if(emscripten_sample_gamepad_data() == EMSCRIPTEN_RESULT_SUCCESS)
++	{
++		int count = emscripten_get_num_gamepads();
++		for(int i = 0; i < count; i++)
++		{
++			EmscriptenGamepadEvent state;
++			if(emscripten_get_gamepad_status(i, &state) != EMSCRIPTEN_RESULT_SUCCESS) continue;
++			if(!state.connected) continue;
++
++			// All connected gamepads drive pad 1 (buttons OR'ed, first moved stick wins).
++			int buttonCount = std::min<int>(state.numButtons, std::size(g_padButtonMap));
++			for(int b = 0; b < buttonCount; b++)
++			{
++				if(state.digitalButton[b] || (state.analogButton[b] > TRIGGER_THRESHOLD))
++				{
++					padValue[g_padButtonMap[b]] = 1;
++				}
++			}
++			if(state.numAxes >= 4)
++			{
++				uint32 lx, ly, rx, ry;
++				ReadStick(state.axis[0], state.axis[1], lx, ly);
++				ReadStick(state.axis[2], state.axis[3], rx, ry);
++				if(padValue[CControllerInfo::ANALOG_LEFT_X] == 0x7F && padValue[CControllerInfo::ANALOG_LEFT_Y] == 0x7F)
++				{
++					padValue[CControllerInfo::ANALOG_LEFT_X] = lx;
++					padValue[CControllerInfo::ANALOG_LEFT_Y] = ly;
++				}
++				if(padValue[CControllerInfo::ANALOG_RIGHT_X] == 0x7F && padValue[CControllerInfo::ANALOG_RIGHT_Y] == 0x7F)
++				{
++					padValue[CControllerInfo::ANALOG_RIGHT_X] = rx;
++					padValue[CControllerInfo::ANALOG_RIGHT_Y] = ry;
++				}
++			}
++		}
++	}
++
++	for(uint32 b = 0; b < CControllerInfo::MAX_BUTTONS; b++)
++	{
++		if(m_padValue[b] == padValue[b]) continue;
++		m_padValue[b] = padValue[b];
++		Publish(static_cast<CControllerInfo::BUTTON>(b));
++	}
++}
++
++void CInputProviderEmscripten::Publish(CControllerInfo::BUTTON button)
++{
++	uint32 value = 0;
++	if(CControllerInfo::IsAxis(button))
++	{
++		value = m_padValue[button];
++		if(value == AXIS_NEUTRAL && (m_keyNeg[button] != m_keyPos[button]))
++		{
++			value = m_keyNeg[button] ? 0x00 : 0xFF;
++		}
++	}
++	else
++	{
++		value = (m_keyNeg[button] || m_padValue[button]) ? 1 : 0;
++	}
++	if(value == m_lastValue[button]) return;
++	m_lastValue[button] = value;
++	OnInput(MakeBindingTarget(button), value);
+ }
+diff --git a/Source/ui_js/InputProviderEmscripten.h b/Source/ui_js/InputProviderEmscripten.h
+index dbd05926..90612d7e 100644
+--- a/Source/ui_js/InputProviderEmscripten.h
++++ b/Source/ui_js/InputProviderEmscripten.h
+@@ -1,16 +1,40 @@
+ #pragma once
+ 
+ #include "input/InputProvider.h"
++#include "ControllerInfo.h"
+ #include <emscripten/html5.h>
+ 
++// One provider for keyboard + browser gamepads (Gamepad API, "standard" layout).
++// Each PS2 control has one binding target (keyId = PS2 button index); the provider
++// merges both sources into it, so keyboard and gamepad work at the same time:
++// - buttons: pressed if pressed on the keyboard OR on any connected gamepad;
++// - analog axes: gamepad stick value when outside the deadzone, else keyboard keys.
++// PollGamepads() must run on the browser main thread (Main.cpp calls it every
++// animation frame); connecting/disconnecting a gamepad is picked up on the next poll.
+ class CInputProviderEmscripten : public CInputProvider
+ {
+ public:
+ 	uint32 GetId() const override;
+ 	std::string GetTargetDescription(const BINDINGTARGET&) const override;
+ 
+-	static BINDINGTARGET MakeBindingTarget(const EM_UTF8* code);
++	static BINDINGTARGET MakeBindingTarget(PS2::CControllerInfo::BUTTON);
+ 
+ 	void OnKeyDown(const EM_UTF8*);
+ 	void OnKeyUp(const EM_UTF8*);
++	void PollGamepads();
++
++private:
++	void OnKey(const EM_UTF8*, bool);
++	void Publish(PS2::CControllerInfo::BUTTON);
++
++	enum
++	{
++		AXIS_NEUTRAL = 0x7F,
++	};
++
++	// Keyboard: buttons use keyNeg only; axes use keyNeg (toward 0x00) / keyPos (toward 0xFF).
++	bool m_keyNeg[PS2::CControllerInfo::MAX_BUTTONS] = {};
++	bool m_keyPos[PS2::CControllerInfo::MAX_BUTTONS] = {};
++	uint32 m_padValue[PS2::CControllerInfo::MAX_BUTTONS] = {AXIS_NEUTRAL, AXIS_NEUTRAL, AXIS_NEUTRAL, AXIS_NEUTRAL};
++	uint32 m_lastValue[PS2::CControllerInfo::MAX_BUTTONS] = {AXIS_NEUTRAL, AXIS_NEUTRAL, AXIS_NEUTRAL, AXIS_NEUTRAL};
+ };
+diff --git a/Source/ui_js/Main.cpp b/Source/ui_js/Main.cpp
+index 999e24ca..a57b5dd2 100644
+--- a/Source/ui_js/Main.cpp
++++ b/Source/ui_js/Main.cpp
+@@ -7,12 +7,179 @@
+ #include "InputProviderEmscripten.h"
+ #include "ui_shared/StatsManager.h"
+ #include "DefaultAppConfig.h"
++#include "../Js_DiscImageDeviceStream.h"
++#include "PS2VM_Preferences.h"
++#include "AppConfig.h"
++#include "string_format.h"
++#include "BlockCache.h"
++#include <future>
++#include <mutex>
++#include <map>
++#include <atomic>
++#include <algorithm>
++#include <emscripten.h>
++
++#ifdef PROFILE
++extern std::atomic<uint64> g_gsThreadBusyNs;
++extern std::atomic<uint32> g_blockCompileCount;
++extern std::atomic<uint32> g_eeSyscallCounts[0x100];
++extern std::atomic<uint32> g_eeInterruptCount;
++extern std::atomic<uint32> g_eeSlices;
++extern std::atomic<uint32> g_eeIdleSlices;
++#endif
+ 
+ CPs2VmJs* g_virtualMachine = nullptr;
+ CGSHandler::NewFrameEvent::Connection g_gsNewFrameConnection;
+ EMSCRIPTEN_WEBGL_CONTEXT_HANDLE g_context = 0;
+ std::shared_ptr<CInputProviderEmscripten> g_inputProvider;
+ CSH_OpenAL* g_soundHandler = nullptr;
++Framework::CSignal<void()>::Connection g_vmNewFrameConnection;
++
++//Profiling/stats snapshot, filled on the emulation thread at every vblank, read by getProfile() on the main thread.
++struct PROFILE_ACCUM
++{
++	uint32 vblanks = 0;
++	CPS2VM::CPU_UTILISATION_INFO cpu;
++	std::map<std::string, uint64> zoneNs;
++	std::string eePcs;
++	std::string iopPcs;
++};
++static std::mutex g_profileMutex;
++static PROFILE_ACCUM g_profile;
++static double g_profileLastTime = 0;
++
++#ifdef PROFILE
++static std::string TopPcs(CProfiler::PcHistogram histogram)
++{
++	std::vector<std::pair<uint32, uint32>> items(histogram.begin(), histogram.end());
++	size_t count = std::min<size_t>(items.size(), 8);
++	std::partial_sort(items.begin(), items.begin() + count, items.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
++	uint64 total = 0;
++	for(const auto& item : items) total += item.second;
++	std::string result;
++	for(size_t i = 0; i < count; i++)
++	{
++		result += string_format("%s[\"%08X\",%.1f]", i ? "," : "", items[i].first, total ? 100.0 * items[i].second / total : 0.0);
++	}
++	return result;
++}
++#endif
++
++//Runs on the emulation thread (CPS2VM::OnNewFrame, at vblank start)
++static void OnVmNewFrame()
++{
++	auto cpu = g_virtualMachine->GetCpuUtilisationInfo();
++	std::lock_guard<std::mutex> lock(g_profileMutex);
++	g_profile.vblanks++;
++	g_profile.cpu.eeTotalTicks += cpu.eeTotalTicks;
++	g_profile.cpu.eeIdleTicks += cpu.eeIdleTicks;
++	g_profile.cpu.iopTotalTicks += cpu.iopTotalTicks;
++	g_profile.cpu.iopIdleTicks += cpu.iopIdleTicks;
++#ifdef PROFILE
++	for(const auto& zone : CProfiler::GetInstance().GetStats())
++	{
++		g_profile.zoneNs[zone.name] += zone.totalTime;
++	}
++	static uint32 vblankCounter = 0;
++	if((++vblankCounter % 50) == 0)
++	{
++		g_profile.eePcs = TopPcs(CProfiler::GetInstance().TakePcHistogram(0));
++		g_profile.iopPcs = TopPcs(CProfiler::GetInstance().TakePcHistogram(1));
++	}
++#endif
++}
++
++//Returns a JSON string with stats accumulated since the previous call.
++std::string getProfile()
++{
++	PROFILE_ACCUM profile;
++	{
++		std::lock_guard<std::mutex> lock(g_profileMutex);
++		profile = g_profile;
++		g_profile = PROFILE_ACCUM();
++		g_profile.eePcs = profile.eePcs;
++		g_profile.iopPcs = profile.iopPcs;
++	}
++	double now = emscripten_get_now();
++	double wallMs = g_profileLastTime ? (now - g_profileLastTime) : 0;
++	g_profileLastTime = now;
++	std::string zones;
++	for(const auto& zone : profile.zoneNs)
++	{
++		zones += string_format("%s\"%s\":%.1f", zones.empty() ? "" : ",", zone.first.c_str(), zone.second / 1e6);
++	}
++	uint64 gsBusyNs = 0;
++	uint32 compiles = 0;
++	std::string extra;
++#ifdef PROFILE
++	gsBusyNs = g_gsThreadBusyNs.exchange(0);
++	compiles = g_blockCompileCount.exchange(0);
++	{
++		std::string syscalls;
++		for(uint32 i = 0; i < 0x100; i++)
++		{
++			uint32 count = g_eeSyscallCounts[i].exchange(0);
++			if(count) syscalls += string_format("%s\"%02X\":%u", syscalls.empty() ? "" : ",", i, count);
++		}
++		auto log = CProfiler::GetInstance().TakeLog();
++		std::string escapedLog;
++		for(char c : log)
++		{
++			if(c == '"' || c == '\\') escapedLog += '\\';
++			if(c == '\n') { escapedLog += "\\n"; continue; }
++			if(static_cast<unsigned char>(c) >= 0x20) escapedLog += c;
++		}
++		extra = string_format(",\"log\":\"%s\",\"syscalls\":{%s},\"eeInts\":%u,\"eeSlices\":%u,\"eeIdleSlices\":%u",
++		                      escapedLog.c_str(), syscalls.c_str(), g_eeInterruptCount.exchange(0), g_eeSlices.exchange(0), g_eeIdleSlices.exchange(0));
++	}
++#endif
++	return string_format("{\"wallMs\":%.1f,\"vblanks\":%u,\"eeTotal\":%d,\"eeIdle\":%d,\"iopTotal\":%d,\"iopIdle\":%d,"
++	                     "\"gsBusyMs\":%.1f,\"compiles\":%u,\"cacheHits\":%u,\"zonesMs\":{%s},\"eePcs\":[%s],\"iopPcs\":[%s]%s}",
++	                     wallMs, profile.vblanks, profile.cpu.eeTotalTicks, profile.cpu.eeIdleTicks,
++	                     profile.cpu.iopTotalTicks, profile.cpu.iopIdleTicks, gsBusyNs / 1e6, compiles, BlockCache::TakeHitCount(),
++	                     zones.c_str(), profile.eePcs.c_str(), profile.iopPcs.c_str(), extra.c_str());
++}
++
++//Save states run on the emulation thread; never block the main thread on them
++//(the GS thread may need the main thread for proxied GL calls). Poll stateStatus().
++static std::future<bool> g_stateFuture;
++static int g_stateResult = 1;
++
++void saveState(std::string path)
++{
++	g_stateResult = -1;
++	g_stateFuture = g_virtualMachine->SaveState(path);
++}
++
++void loadState(std::string path)
++{
++	g_stateResult = -1;
++	g_stateFuture = g_virtualMachine->LoadState(path);
++}
++
++//-1: pending, 0: failed, 1: done/ok
++int stateStatus()
++{
++	if(g_stateFuture.valid() && g_stateFuture.wait_for(std::chrono::seconds(0)) == std::future_status::ready)
++	{
++		g_stateResult = g_stateFuture.get() ? 1 : 0;
++	}
++	return g_stateResult;
++}
++
++void setFrameLimit(bool enabled)
++{
++	CAppConfig::GetInstance().SetPreferenceBoolean(PREF_PS2_LIMIT_FRAMERATE, enabled);
++	g_virtualMachine->ReloadFrameRateLimit();
++}
++
++//EE underclock (numerator/denominator of the real EE clock), like PCSX2's EE cycle rate:
++//the EE gets fewer cycles per vblank while IOP, SPU and vblank timing stay real time.
++void setEeFrequencyScale(int numerator, int denominator)
++{
++	if((numerator <= 0) || (denominator <= 0)) return;
++	g_virtualMachine->SetEeFrequencyScale(numerator, denominator);
++}
+ 
+ int main(int argc, const char** argv)
+ {
+@@ -20,6 +187,13 @@ int main(int argc, const char** argv)
+ 	return 0;
+ }
+ 
++//Browser Gamepad API is only reachable from the main thread: poll it every animation frame.
++EM_BOOL gamepadPollCallback(double, void*)
++{
++	g_inputProvider->PollGamepads();
++	return EM_TRUE;
++}
++
+ EM_BOOL keyboardCallback(int eventType, const EmscriptenKeyboardEvent* keyEvent, void* userData)
+ {
+ 	if(keyEvent->repeat)
+@@ -71,36 +245,13 @@ extern "C" void initVm()
+ 		g_inputProvider = std::make_shared<CInputProviderEmscripten>();
+ 		bindingManager.RegisterInputProvider(g_inputProvider);
+ 
+-		bindingManager.SetSimpleBinding(0, PS2::CControllerInfo::START, CInputProviderEmscripten::MakeBindingTarget("Enter"));
+-		bindingManager.SetSimpleBinding(0, PS2::CControllerInfo::SELECT, CInputProviderEmscripten::MakeBindingTarget("Backspace"));
+-		bindingManager.SetSimpleBinding(0, PS2::CControllerInfo::DPAD_LEFT, CInputProviderEmscripten::MakeBindingTarget("ArrowLeft"));
+-		bindingManager.SetSimpleBinding(0, PS2::CControllerInfo::DPAD_RIGHT, CInputProviderEmscripten::MakeBindingTarget("ArrowRight"));
+-		bindingManager.SetSimpleBinding(0, PS2::CControllerInfo::DPAD_UP, CInputProviderEmscripten::MakeBindingTarget("ArrowUp"));
+-		bindingManager.SetSimpleBinding(0, PS2::CControllerInfo::DPAD_DOWN, CInputProviderEmscripten::MakeBindingTarget("ArrowDown"));
+-		bindingManager.SetSimpleBinding(0, PS2::CControllerInfo::SQUARE, CInputProviderEmscripten::MakeBindingTarget("KeyA"));
+-		bindingManager.SetSimpleBinding(0, PS2::CControllerInfo::CROSS, CInputProviderEmscripten::MakeBindingTarget("KeyZ"));
+-		bindingManager.SetSimpleBinding(0, PS2::CControllerInfo::TRIANGLE, CInputProviderEmscripten::MakeBindingTarget("KeyS"));
+-		bindingManager.SetSimpleBinding(0, PS2::CControllerInfo::CIRCLE, CInputProviderEmscripten::MakeBindingTarget("KeyX"));
+-		bindingManager.SetSimpleBinding(0, PS2::CControllerInfo::L1, CInputProviderEmscripten::MakeBindingTarget("Key1"));
+-		bindingManager.SetSimpleBinding(0, PS2::CControllerInfo::L2, CInputProviderEmscripten::MakeBindingTarget("Key2"));
+-		bindingManager.SetSimpleBinding(0, PS2::CControllerInfo::L3, CInputProviderEmscripten::MakeBindingTarget("Key3"));
+-		bindingManager.SetSimpleBinding(0, PS2::CControllerInfo::R1, CInputProviderEmscripten::MakeBindingTarget("Key8"));
+-		bindingManager.SetSimpleBinding(0, PS2::CControllerInfo::R2, CInputProviderEmscripten::MakeBindingTarget("Key9"));
+-		bindingManager.SetSimpleBinding(0, PS2::CControllerInfo::R3, CInputProviderEmscripten::MakeBindingTarget("Key0"));
+-
+-		bindingManager.SetSimulatedAxisBinding(0, PS2::CControllerInfo::ANALOG_LEFT_X,
+-		                                       CInputProviderEmscripten::MakeBindingTarget("KeyF"),
+-		                                       CInputProviderEmscripten::MakeBindingTarget("KeyH"));
+-		bindingManager.SetSimulatedAxisBinding(0, PS2::CControllerInfo::ANALOG_LEFT_Y,
+-		                                       CInputProviderEmscripten::MakeBindingTarget("KeyT"),
+-		                                       CInputProviderEmscripten::MakeBindingTarget("KeyG"));
+-
+-		bindingManager.SetSimulatedAxisBinding(0, PS2::CControllerInfo::ANALOG_RIGHT_X,
+-		                                       CInputProviderEmscripten::MakeBindingTarget("KeyJ"),
+-		                                       CInputProviderEmscripten::MakeBindingTarget("KeyL"));
+-		bindingManager.SetSimulatedAxisBinding(0, PS2::CControllerInfo::ANALOG_RIGHT_Y,
+-		                                       CInputProviderEmscripten::MakeBindingTarget("KeyI"),
+-		                                       CInputProviderEmscripten::MakeBindingTarget("KeyK"));
++		//Keyboard and gamepads are merged by the provider, one target per PS2 control.
++		for(uint32 button = 0; button < PS2::CControllerInfo::MAX_BUTTONS; button++)
++		{
++			auto ps2Button = static_cast<PS2::CControllerInfo::BUTTON>(button);
++			bindingManager.SetSimpleBinding(0, ps2Button, CInputProviderEmscripten::MakeBindingTarget(ps2Button));
++		}
++		bindingManager.ResetBindingValues();
+ 	}
+ 
+ 	{
+@@ -108,6 +259,7 @@ extern "C" void initVm()
+ 		g_virtualMachine->CreateSoundHandler(CSH_OpenALProxy::GetFactoryFunction(g_soundHandler));
+ 	}
+ 
++	g_vmNewFrameConnection = g_virtualMachine->OnNewFrame.Connect(&OnVmNewFrame);
+ 	g_gsNewFrameConnection = g_virtualMachine->GetGSHandler()->OnNewFrame.Connect(std::bind(&CStatsManager::OnGsNewFrame, &CStatsManager::GetInstance(), std::placeholders::_1));
+ 
+ 	EMSCRIPTEN_RESULT result = EMSCRIPTEN_RESULT_SUCCESS;
+@@ -117,6 +269,8 @@ extern "C" void initVm()
+ 
+ 	result = emscripten_set_keyup_callback("#outputCanvas", nullptr, false, &keyboardCallback);
+ 	assert(result == EMSCRIPTEN_RESULT_SUCCESS);
++
++	emscripten_request_animation_frame_loop(&gamepadPollCallback, nullptr);
+ }
+ 
+ void bootElf(std::string path)
+@@ -139,12 +293,45 @@ void clearStats()
+ 	CStatsManager::GetInstance().ClearStats();
+ }
+ 
++//Persistent JIT block cache (see BlockCache.h). The page owns storage (OPFS): it loads the
++//saved entries for a game before booting it and periodically appends what blockCacheTakePending returns.
++static uint32 blockCacheLoad(emscripten::val data)
++{
++	auto bytes = emscripten::convertJSArrayToNumberVector<uint8>(data);
++	return BlockCache::Load(bytes.data(), bytes.size());
++}
++
++static emscripten::val blockCacheTakePending()
++{
++	auto pending = BlockCache::TakePending();
++	if(pending.empty()) return emscripten::val::null();
++	//Copy out of the (shared) wasm heap so the result can be written to OPFS
++	return emscripten::val::global("Uint8Array").new_(emscripten::typed_memory_view(pending.size(), pending.data()));
++}
++
++static double blockCachePendingSize()
++{
++	return static_cast<double>(BlockCache::GetPendingSize());
++}
++
+ EMSCRIPTEN_BINDINGS(Play)
+ {
+ 	using namespace emscripten;
+ 
+ 	function("bootElf", &bootElf);
+ 	function("bootDiscImage", &bootDiscImage);
++	function("setDiscImageUrl", &Js_SetDiscImageUrl);
+ 	function("getFrames", &getFrames);
+ 	function("clearStats", &clearStats);
++	function("getProfile", &getProfile);
++	function("saveState", &saveState);
++	function("loadState", &loadState);
++	function("stateStatus", &stateStatus);
++	function("setFrameLimit", &setFrameLimit);
++	function("setEeFrequencyScale", &setEeFrequencyScale);
++	function("blockCacheEnable", &BlockCache::SetEnabled);
++	function("blockCacheClear", &BlockCache::Clear);
++	function("blockCacheLoad", &blockCacheLoad);
++	function("blockCacheTakePending", &blockCacheTakePending);
++	function("blockCachePendingSize", &blockCachePendingSize);
+ }

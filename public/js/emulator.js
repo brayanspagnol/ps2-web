@@ -1,0 +1,213 @@
+// Thin wrapper around the Play! WebAssembly build (public/emu/Play.js + Play.wasm).
+// The wasm side renders into the element with id "outputCanvas" (640x480) and
+// listens for keyboard events on it, so that canvas must exist before init().
+// ?emu=<name> picks the build in public/emu-<name>/ (A/B tests); default public/emu/.
+const EMU_VARIANT = new URLSearchParams(location.search).get("emu");
+const EMU_DIR = new URL(/^[a-z0-9-]+$/.test(EMU_VARIANT ?? "") ? `../emu-${EMU_VARIANT}/` : "../emu/", import.meta.url).href;
+
+// Play! asks JS for disc sectors through this object and polls isDone().
+class DiscImageDevice {
+  constructor(module) { this.module = module; this.file = null; this.done = false; }
+  setFile(file) { this.file = file; }
+  getFileSize() { return this.file.size; }
+  isDone() { return this.done; }
+  read(dstPtr, offset, size) {
+    this.done = false;
+    this.file.slice(offset, offset + size).arrayBuffer().then((buf) => {
+      this.module.HEAPU8.set(new Uint8Array(buf), dstPtr);
+      this.done = true;
+    }, (e) => console.error(`Falha ao ler o disco (${offset}+${size}):`, e)); // RemoteFile already retried
+  }
+}
+
+let mod = null;
+let discBlobUrl = null;
+
+export const SUPPORTED_EXTENSIONS = [".iso", ".cso", ".chd", ".isz", ".bin", ".elf"];
+
+export async function init() {
+  if (mod) return mod;
+  if (!crossOriginIsolated) {
+    throw new Error("Página sem cross-origin isolation (COOP/COEP): SharedArrayBuffer indisponível.");
+  }
+  if (!document.getElementById("outputCanvas")) {
+    throw new Error('Canvas #outputCanvas ausente no DOM.');
+  }
+  const { default: Play } = await import(EMU_DIR + "Play.js");
+  mod = await Play({
+    locateFile: (path) => EMU_DIR + path,
+    mainScriptUrlOrBlob: EMU_DIR + "Play.js",
+  });
+  mod.FS.mkdir("/work");
+  mod.discImageDevice = new DiscImageDevice(mod);
+  mod.ccall("initVm", "", [], []);
+  return mod;
+}
+
+// Boots a user-supplied disc image or ELF: a File, or a library RemoteFile
+// (same name/size/slice().arrayBuffer()/arrayBuffer() surface, streamed over HTTP).
+// options.blockCache = false disables the persistent JIT block cache for this boot.
+export async function boot(file, { blockCache = true } = {}) {
+  if (!mod) throw new Error("Chame init() antes de boot().");
+  const dot = file.name.lastIndexOf(".");
+  const ext = dot === -1 ? "" : file.name.slice(dot).toLowerCase();
+  if (!SUPPORTED_EXTENSIONS.includes(ext)) {
+    throw new Error(`Formato não suportado: "${ext || file.name}". Use ${SUPPORTED_EXTENSIONS.join(", ")}.`);
+  }
+  await setBlockCache(blockCache ? `${file.name}-${file.size}` : null);
+  if (ext === ".elf") {
+    const data = new Uint8Array(await file.arrayBuffer());
+    mod.FS.writeFile(file.name, data);
+    mod.bootElf(file.name);
+  } else {
+    mod.discImageDevice.setFile(file);
+    // Let the emulation thread fetch sectors itself (sync XHR + 1 MB block cache in
+    // its worker) instead of a main-thread round trip + polling per sector.
+    // Server games have a URL; local Files get a blob: URL (Range works on those too).
+    if (discBlobUrl) URL.revokeObjectURL(discBlobUrl);
+    discBlobUrl = file.url ? null : URL.createObjectURL(file);
+    mod.setDiscImageUrl(new URL(file.url ?? discBlobUrl, location.href).href);
+    mod.bootDiscImage(file.name);
+  }
+  document.getElementById("outputCanvas").focus();
+}
+
+// Frames presented since the previous call; call once per interval to get FPS.
+export function takeFrames() {
+  if (!mod) return 0;
+  const n = mod.getFrames();
+  mod.clearStats();
+  return n;
+}
+
+// ---- Persistent JIT block cache -------------------------------------------------------------
+// The emulator compiles each new block of PS2 code to a small WebAssembly module (1-3 ms each),
+// which stutters when new code shows up and after loading a state. Compiled modules are kept in
+// OPFS (blockcache/<game>/<n>.bin: header + entries appended by the emulator) and fed back
+// before the next boot, so already-seen code skips the compiler. Every segment carries a salt
+// that changes with each Play.wasm build; segments from another build are deleted on load.
+const BC_MAGIC = "PLAYBLK1";
+const BC_MAX_SEGMENTS = 16; // merged into one file at load beyond this
+let bc = null;              // { dirName, next, header, lastFlush }
+let bcTimer = null;
+let bcFlushing = null;
+
+async function bcHeader() {
+  const r = await fetch(EMU_DIR + "Play.wasm", { method: "HEAD", cache: "no-store" });
+  const h = (k) => r.headers.get(k) ?? "";
+  if (!r.ok || !(h("etag") || h("last-modified"))) return null; // can't tell builds apart
+  const salt = new TextEncoder().encode(`${h("etag")}|${h("last-modified")}|${h("content-length")}`);
+  const header = new Uint8Array(12 + salt.length);
+  header.set(new TextEncoder().encode(BC_MAGIC));
+  new DataView(header.buffer).setUint32(8, salt.length, true);
+  header.set(salt, 12);
+  return header;
+}
+
+const bcRoot = async () => (await navigator.storage.getDirectory()).getDirectoryHandle("blockcache", { create: true });
+// One directory per game and per build variant (?emu=), so A/B builds don't evict each other.
+const bcDirName = (gameKey) => `${EMU_VARIANT ?? "emu"}-${gameKey}`.replace(/[^\w.-]+/g, "_").slice(0, 120);
+
+// Loads the cache of one game (any string; null disables the cache) into the emulator.
+// boot() calls it; call it yourself only to boot without boot().
+export async function setBlockCache(gameKey) {
+  if (!mod) throw new Error("Chame init() antes de setBlockCache().");
+  await flushBlockCache();
+  clearInterval(bcTimer);
+  bc = null;
+  mod.blockCacheEnable(false);
+  mod.blockCacheClear();
+  if (!gameKey) return;
+  try {
+    const header = await bcHeader();
+    if (!header) return;
+    const dirName = bcDirName(gameKey);
+    const dir = await (await bcRoot()).getDirectoryHandle(dirName, { create: true });
+    const files = [];
+    for await (const [name, handle] of dir.entries()) {
+      if (/^\d+\.bin$/.test(name)) files.push({ n: parseInt(name, 10), name, handle });
+    }
+    files.sort((a, b) => a.n - b.n);
+    const bodies = [];
+    let stale = false, bad = 0;
+    for (const f of files) {
+      const buf = new Uint8Array(await (await f.handle.getFile()).arrayBuffer());
+      if (buf.length >= header.length && header.every((b, i) => buf[i] === b)) {
+        bodies.push(buf.subarray(header.length));
+      } else if (buf.length >= 8 && BC_MAGIC.split("").every((c, i) => buf[i] === c.charCodeAt(0))) {
+        stale = true; // written by another emulator build: drop everything
+        break;
+      } else {
+        bad++; // empty/truncated (e.g. page closed during a flush): drop just this segment
+        await dir.removeEntry(f.name).catch(() => {});
+      }
+    }
+    let next = files.length ? files[files.length - 1].n + 1 : 0;
+    if (stale) bodies.length = 0;
+    let entries = 0;
+    for (const body of bodies) entries += mod.blockCacheLoad(body); // entries are checksummed in C++
+    if (stale || bodies.length > BC_MAX_SEGMENTS) {
+      if (bodies.length) { // merge into one segment
+        const merged = new Uint8Array(bodies.reduce((n, b) => n + b.length, 0));
+        let o = 0;
+        for (const b of bodies) { merged.set(b, o); o += b.length; }
+        await bcWrite(dir, `${next++}.bin`, header, merged);
+      }
+      for (const f of files) await dir.removeEntry(f.name).catch(() => {});
+    }
+    bc = { dirName, next, header, lastFlush: performance.now() };
+    mod.blockCacheEnable(true);
+    bcTimer = setInterval(() => {
+      if (mod.blockCachePendingSize() >= (1 << 20) || performance.now() - bc.lastFlush > 30000) flushBlockCache();
+    }, 5000);
+    console.log(`Block cache "${gameKey}": ${entries} blocks loaded${stale ? " (old build discarded)" : ""}${bad ? `, ${bad} bad segment(s) dropped` : ""}.`);
+  } catch (e) {
+    console.warn("Block cache unavailable:", e);
+  }
+}
+
+async function bcWrite(dir, name, header, body) {
+  // Resolve by name: another tab may have cleared the cache since this one opened it.
+  if (typeof dir === "string") dir = await (await bcRoot()).getDirectoryHandle(dir, { create: true });
+  const w = await (await dir.getFileHandle(name, { create: true })).createWritable();
+  await w.write(header);
+  await w.write(body);
+  await w.close();
+}
+
+// Writes blocks compiled since the last flush to OPFS (runs every 30 s / 1 MB and when the page hides).
+export function flushBlockCache() {
+  bcFlushing ??= (async () => {
+    const cur = bc;
+    const data = cur && mod.blockCacheTakePending();
+    if (!data) return;
+    cur.lastFlush = performance.now();
+    await bcWrite(cur.dirName, `${cur.next++}.bin`, cur.header, data);
+  })().catch((e) => console.warn("Block cache flush failed:", e)).finally(() => { bcFlushing = null; });
+  return bcFlushing;
+}
+
+// Deletes the cache of every game, or only of gameKey (same key as setBlockCache: boot() uses
+// "<file name>-<size>"). If the running game's cache is deleted it keeps caching from scratch.
+export async function clearBlockCache(gameKey) {
+  await bcFlushing;
+  if (gameKey) await (await bcRoot()).removeEntry(bcDirName(gameKey), { recursive: true }).catch(() => {});
+  else await (await navigator.storage.getDirectory()).removeEntry("blockcache", { recursive: true }).catch(() => {});
+  if (bc && (!gameKey || bc.dirName === bcDirName(gameKey))) {
+    mod.blockCacheClear();
+    bc.next = 0;
+  }
+}
+
+// Cache size on disk in bytes, per game.
+export async function blockCacheUsage() {
+  const r = {};
+  for await (const [game, dir] of (await bcRoot()).entries()) {
+    r[game] = 0;
+    for await (const [, f] of dir.entries()) r[game] += (await f.getFile()).size;
+  }
+  return r;
+}
+
+addEventListener("visibilitychange", () => { if (document.hidden) flushBlockCache(); });
+addEventListener("pagehide", () => flushBlockCache());

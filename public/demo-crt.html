@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Demo TV CRT</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0d0d10; color: #ddd; font: 14px system-ui, sans-serif; overflow: hidden; }
+  #view { position: fixed; inset: 0; display: block; width: 100%; height: 100%; }
+  #ui { position: fixed; top: 12px; left: 12px; display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+        background: rgba(0,0,0,.55); padding: 10px; border-radius: 8px; max-width: calc(100% - 44px); }
+  #ui button { background: #222; color: #eee; border: 1px solid #555; border-radius: 6px; padding: 6px 12px; cursor: pointer; }
+  #status { font-family: monospace; width: 100%; }
+  .err { color: #f66; }
+</style>
+<script type="importmap">{"imports":{"three":"/vendor/three.module.js","three/addons/":"/vendor/addons/"}}</script>
+</head>
+<body>
+<canvas id="outputCanvas" width="640" height="480" tabindex="-1"></canvas>
+<canvas id="view"></canvas>
+<div id="ui">
+  <input type="file" id="file" accept=".iso,.cso,.chd,.isz,.bin,.elf" disabled>
+  <button id="power" type="button">Power</button>
+  <button id="crt" type="button">CRT: ligado</button>
+  <button id="fs" type="button">Tela cheia</button>
+  <div id="status">Carregando emulador…</div>
+</div>
+<script type="module">
+  import * as THREE from "three";
+  import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+  import * as emu from "./js/emulator.js";
+  import { createCrtTv } from "./js/crt-tv.js";
+
+  const status = document.getElementById("status");
+  const input = document.getElementById("file");
+  const fail = (e) => { status.textContent = "Erro: " + e.message; status.className = "err"; console.error(e); };
+
+  const renderer = new THREE.WebGLRenderer({ canvas: document.getElementById("view"), antialias: true });
+  renderer.setPixelRatio(devicePixelRatio);
+  renderer.shadowMap.enabled = true;
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x15151a);
+  const camera = new THREE.PerspectiveCamera(40, 1, 0.01, 50);
+  camera.position.set(0.35, 0.55, 1.35);
+  const controls = new OrbitControls(camera, renderer.domElement);
+  controls.target.set(0, 0.3, 0);
+  controls.enableDamping = true;
+
+  scene.add(new THREE.HemisphereLight(0xdde4ff, 0x302820, 0.9));
+  const sun = new THREE.DirectionalLight(0xfff1dd, 2.2);
+  sun.position.set(1.5, 2.5, 2);
+  sun.castShadow = true;
+  sun.shadow.mapSize.set(1024, 1024);
+  Object.assign(sun.shadow.camera, { left: -1, right: 1, top: 1, bottom: -1 });
+  scene.add(sun);
+  const floor = new THREE.Mesh(new THREE.PlaneGeometry(6, 6), new THREE.MeshStandardMaterial({ color: 0x3a2f27, roughness: 0.9 }));
+  floor.rotation.x = -Math.PI / 2;
+  floor.receiveShadow = true;
+  scene.add(floor);
+
+  const style = new URLSearchParams(location.search).get("style") || "grey";
+  const tv = createCrtTv({ sourceCanvas: document.getElementById("outputCanvas"), style });
+  scene.add(tv.object3d);
+  window.demo = { tv, renderer, scene, camera }; // handy for debugging from the console
+
+  let powered = false;
+  document.getElementById("power").onclick = () => tv.setPower(powered = !powered);
+  const crtBtn = document.getElementById("crt");
+  let crt = true;
+  crtBtn.onclick = () => { tv.setCrtEffect(crt = !crt); crtBtn.textContent = crt ? "CRT: ligado" : "CRT: desligado"; };
+  document.getElementById("fs").onclick = () => tv.enterFullscreen();
+
+  function resize() {
+    renderer.setSize(innerWidth, innerHeight, false);
+    camera.aspect = innerWidth / innerHeight;
+    camera.updateProjectionMatrix();
+  }
+  addEventListener("resize", resize);
+  resize();
+
+  let last = performance.now(), renderFrames = 0;
+  renderer.setAnimationLoop((now) => {
+    const dt = Math.min((now - last) / 1000, 0.1);
+    last = now;
+    controls.update();
+    tv.update(dt, renderer);
+    renderer.render(scene, camera);
+    renderFrames++;
+  });
+
+  tv.setPower(powered = true); // no signal yet: static
+
+  try {
+    await emu.init();
+    status.textContent = "Emulador pronto. Escolha um ELF ou ISO.";
+    input.disabled = false;
+  } catch (e) { fail(e); }
+
+  input.addEventListener("change", async () => {
+    const file = input.files[0];
+    if (!file) return;
+    try {
+      await emu.boot(file);
+      tv.setSignal(true);
+      status.className = "";
+      emu.takeFrames(); renderFrames = 0;
+      setInterval(() => {
+        window.lastFps = { emu: emu.takeFrames(), render: renderFrames };
+        status.textContent = `${file.name} | emulador ${window.lastFps.emu} FPS | cena ${renderFrames} FPS`;
+        renderFrames = 0;
+      }, 1000);
+    } catch (e) { fail(e); }
+  });
+</script>
+</body>
+</html>

@@ -1,0 +1,11 @@
+# Emulator source lives in its own repo (fork of jpd002/Play-)
+/play-src/
+
+# The user's own game dumps never go into the repo
+/games/*
+!/games/README.txt
+
+# Throwaway emulator variants for A/B tests (public/emu/ is the shipped build)
+/public/emu-*/
+
+__pycache__/

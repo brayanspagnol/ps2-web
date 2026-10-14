@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PS2 na Sala</title>
+<meta name="description" content="Escolha o jogo, coloque o disco no console e jogue numa TV de tubo, tudo no navegador.">
+<style>
+  :root { color-scheme: dark; --fg: #eef0f6; --muted: #9aa1b2; --line: rgba(255,255,255,.14); }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #07080b; color: var(--fg);
+    font: 14px 'Inter', 'Segoe UI', Roboto, 'Noto Sans', Arial, sans-serif; }
+  /* Emulator output: hidden but still rendering and focusable (it is copied onto the TV). */
+  #outputCanvas { position: fixed; left: 0; top: 0; opacity: .01; z-index: -1; pointer-events: none; }
+  #stage { position: fixed; inset: 0; }
+  #library { position: fixed; inset: 0; z-index: 2;
+    background: linear-gradient(to bottom, rgba(5,6,9,.55), rgba(5,6,9,.25) 40%, rgba(5,6,9,.8)); }
+  #library[hidden] { display: none; }
+  #hud { position: fixed; z-index: 3; left: 16px; right: 16px; bottom: 16px; display: flex; flex-wrap: wrap; gap: 8px;
+    align-items: center; justify-content: center; transition: opacity .4s; }
+  #hud[hidden] { display: none; }
+  #hud.idle { opacity: 0; }
+  #hud button { font: inherit; color: var(--fg); background: rgba(12,14,20,.72); border: 1px solid var(--line);
+    border-radius: 999px; padding: 9px 16px; min-height: 40px; cursor: pointer; backdrop-filter: blur(8px); }
+  #hud button:hover { background: rgba(40,48,70,.8); }
+  #hud button:focus-visible { outline: 2px solid #5aa9ff; outline-offset: 2px; }
+  #fps, #msg { font: 12px ui-monospace, monospace; color: var(--muted); padding: 0 6px; }
+  #msg { position: fixed; z-index: 3; left: 16px; right: 16px; top: 16px; text-align: center; font-size: 14px; color: var(--fg); }
+  #msg.err { color: #ff8a8a; }
+  #keys { width: 100%; text-align: center; color: var(--muted); font-size: 12px; }
+  @media (max-width: 600px) { #keys { display: none; } }
+</style>
+<script type="importmap">{"imports":{"three":"/vendor/three.module.js","three/addons/":"/vendor/addons/"}}</script>
+</head>
+<body>
+<canvas id="outputCanvas" width="640" height="480" tabindex="-1" aria-label="Tela do jogo"></canvas>
+<div id="stage"></div>
+<div id="library"></div>
+<p id="msg" role="status" aria-live="polite"></p>
+<div id="hud" hidden>
+  <button type="button" id="b-lib">Trocar jogo</button>
+  <button type="button" id="b-fs">Tela cheia</button>
+  <button type="button" id="b-crt" aria-pressed="true">Efeito CRT: ligado</button>
+  <span id="fps"></span>
+  <p id="keys">Setas: D-pad · Z ✕ · X ◯ · A ▢ · S △ · Enter Start · Backspace Select · 1/2 L1/L2 · 8/9 R1/R2 · FTGH / IJKL analógicos</p>
+</div>
+<script type="module">
+  import * as emu from "./js/emulator.js";
+  import { createConsoleScene } from "./js/console-scene.js";
+  import { createCrtTv } from "./js/crt-tv.js";
+  import { createLibraryUI, renderDiscLabel } from "./js/library.js";
+
+  const $ = (id) => document.getElementById(id);
+  const msg = (text, err = false) => { $("msg").textContent = text; $("msg").className = err ? "err" : ""; };
+
+  const view = createConsoleScene($("stage"));
+  const tv = createCrtTv({ sourceCanvas: $("outputCanvas") });
+  view.tvAnchor.add(tv.object3d);
+  view.onFrame((dt) => tv.update(dt, view.renderer)); // keeps the scene rendering every frame for the live TV
+
+  // Load the emulator in the background while the user browses the shelf.
+  const emuReady = emu.init();
+  emuReady.catch((e) => msg("Não foi possível iniciar o emulador: " + e.message, true));
+
+  let fpsTimer = 0, busy = false;
+
+  const library = createLibraryUI($("library"), { onPlay: play });
+
+  async function play(game, file) {
+    if (busy) return;
+    busy = true;
+    try {
+      library.hide();
+      $("library").hidden = true;
+      msg("");
+      await view.insertDisc({ id: game.id, title: game.title, color: game.palette?.accent ?? "#5aa9ff", labelCanvas: renderDiscLabel(game) });
+      tv.setSignal(false);
+      await Promise.all([tv.setPower(true), view.focusTv()]);
+      await emuReady;
+      await emu.boot(file);
+      tv.setSignal(true);
+      showHud();
+    } catch (e) {
+      console.error(e);
+      msg(`Falha ao iniciar ${game.title}: ${e.message}`, true);
+      await backToLibrary();
+    } finally {
+      busy = false;
+    }
+  }
+
+  // Play! has no "stop" call; the VM keeps running until the next boot resets it.
+  // So going back only blanks the TV and ejects; booting another game replaces it.
+  async function backToLibrary() {
+    $("hud").hidden = true;
+    clearInterval(fpsTimer);
+    if (tv.isFullscreen()) await tv.exitFullscreen();
+    tv.setSignal(false);
+    await Promise.all([tv.setPower(false), view.focusConsole()]);
+    await view.ejectDisc();
+    $("library").hidden = false;
+    library.show();
+    await library.refresh();
+  }
+
+  function showHud() {
+    $("hud").hidden = false;
+    emu.takeFrames();
+    clearInterval(fpsTimer);
+    fpsTimer = setInterval(() => { $("fps").textContent = `${emu.takeFrames()} FPS`; }, 1000);
+    $("outputCanvas").focus();
+  }
+
+  $("b-lib").addEventListener("click", () => { if (!busy) { busy = true; backToLibrary().finally(() => (busy = false)); } });
+  $("b-fs").addEventListener("click", () => tv.enterFullscreen());
+  $("b-crt").addEventListener("click", (e) => {
+    const on = e.currentTarget.getAttribute("aria-pressed") !== "true";
+    tv.setCrtEffect(on);
+    e.currentTarget.setAttribute("aria-pressed", String(on));
+    e.currentTarget.textContent = `Efeito CRT: ${on ? "ligado" : "desligado"}`;
+  });
+
+  // Fade the HUD out while playing; any mouse movement brings it back.
+  let idleTimer = 0;
+  addEventListener("pointermove", () => {
+    $("hud").classList.remove("idle");
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => $("hud").classList.add("idle"), 3000);
+  });
+</script>
+</body>
+</html>
