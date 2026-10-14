@@ -12,6 +12,15 @@ Where the time goes today (GTA SA free roam, VM thread, ms per second): EE JIT c
 VU1 ~320, EE dispatcher ~85, VIF1 ~75, GIF ~33, compile ~30, IOP ~20, SPU ~17. One core at 100%,
 the rest idle. Target: ~2.5-3x faster VM thread for GTA SA; lighter games need less.
 
+## Status (2026-10-14, end of day)
+Shipped in public/emu (Play! fork, branch web-perf): stale-JIT fix (software write protection), idle
+detection, IPU IDCT, persistent JIT block cache, quick save/load, AudioWorklet audio with WSOLA
+time-stretching, VU1 on its own thread (MTVU). FFX intro 3D ~58/60 vbl/s; GTA SA free roam ~22-24/50
+(EE/VM thread bound).
+In progress (fork branches, see notes/): `vu-jit` (VU codegen: context promotion, differential test,
+VU1 replay benchmark), `ee-jit` (EE dispatcher/block linking/traces — the GTA bottleneck).
+Next: finish ee-jit and vu-jit, merge into web-perf with ABAB measurements, then Phase 3 traces.
+
 ## Phase 1: quick wins (days)
 - Persistent compiled-block cache in OPFS: no JIT stutter or warm-up on the second run. (in progress)
 - Direct block linking with wasm tail calls (`return_call`), removing most dispatcher round trips.

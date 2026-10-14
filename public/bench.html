@@ -14,7 +14,7 @@
 <body>
 <!-- Dev harness for performance work (see OPTIMIZATION.md).
      ?game=<file in /games>&emu=<variant>&state=<OPFS save-state name to load after boot>
-     &blockcache=0 boots without the persistent JIT block cache, &blockcache=clear empties this game's cache first.
+     &vujit=1,1 sets VU JIT options (promotion, differential test); &blockcache=0 boots without the persistent JIT block cache, &blockcache=clear empties this game's cache first.
      window.bench: save(name), load(name), states(), prof (array of per-second samples),
      clearBlockCache(), flushBlockCache(), blockCacheUsage(). -->
 <div id="status">loading…</div>
@@ -64,6 +64,8 @@
   if (game) {
     const url = new URL("games/" + encodeURIComponent(game), location.href).href;
     const size = Number((await fetch(url, { method: "HEAD" })).headers.get("content-length"));
+    // &vujit=<promotion 0|1>,<diff 0|1>[,<name JIT functions 0|1>]: VU JIT debug options (builds that export setVuJitOptions)
+    if (q.get("vujit") && mod.setVuJitOptions) { const [p, d, n] = q.get("vujit").split(",").map(Number); mod.setVuJitOptions(!!p, !!d, !!n); }
     if (q.get("blockcache") === "clear") await emu.clearBlockCache(`${game}-${size}`);
     await emu.boot({ name: game, size, url, slice: () => { throw new Error("url only"); } }, { blockCache: q.get("blockcache") !== "0" });
     if (q.get("state")) {
