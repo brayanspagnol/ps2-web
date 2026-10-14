@@ -22,6 +22,7 @@ class DiscImageDevice {
 
 let mod = null;
 let discBlobUrl = null;
+let gameKey = null; // "<file name>-<size>" of the booted game (save-state slot name)
 
 export const SUPPORTED_EXTENSIONS = [".iso", ".cso", ".chd", ".isz", ".bin", ".elf"];
 
@@ -54,7 +55,8 @@ export async function boot(file, { blockCache = true } = {}) {
   if (!SUPPORTED_EXTENSIONS.includes(ext)) {
     throw new Error(`Formato não suportado: "${ext || file.name}". Use ${SUPPORTED_EXTENSIONS.join(", ")}.`);
   }
-  await setBlockCache(blockCache ? `${file.name}-${file.size}` : null);
+  gameKey = `${file.name}-${file.size}`;
+  await setBlockCache(blockCache ? gameKey : null);
   if (ext === ".elf") {
     const data = new Uint8Array(await file.arrayBuffer());
     mod.FS.writeFile(file.name, data);
@@ -78,6 +80,47 @@ export function takeFrames() {
   const n = mod.getFrames();
   mod.clearStats();
   return n;
+}
+
+// ---- Quick save / load ---------------------------------------------------------------------
+// One save-state slot per game, kept in OPFS (savestates/<game>.zip). States run on the
+// emulation thread; we poll stateStatus() instead of blocking the main thread.
+async function waitState() {
+  for (;;) {
+    const s = mod.stateStatus();
+    if (s !== -1) return s === 1;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+}
+
+async function stateFile(create) {
+  const root = await navigator.storage.getDirectory();
+  const dir = await root.getDirectoryHandle("savestates", { create: true });
+  return dir.getFileHandle(gameKey.replace(/[^\w.-]+/g, "_").slice(0, 120) + ".zip", { create });
+}
+
+export async function saveState() {
+  if (!mod || !gameKey) throw new Error("Nenhum jogo rodando.");
+  mod.saveState("/work/quick.zip");
+  if (!(await waitState())) throw new Error("Não foi possível salvar o estado.");
+  const data = mod.FS.readFile("/work/quick.zip");
+  const w = await (await stateFile(true)).createWritable();
+  await w.write(data);
+  await w.close();
+}
+
+export async function hasSavedState() {
+  if (!gameKey) return false;
+  try { await stateFile(false); return true; } catch { return false; }
+}
+
+export async function loadState() {
+  if (!mod || !gameKey) throw new Error("Nenhum jogo rodando.");
+  let fh;
+  try { fh = await stateFile(false); } catch { throw new Error("Este jogo ainda não tem um estado salvo."); }
+  mod.FS.writeFile("/work/quick.zip", new Uint8Array(await (await fh.getFile()).arrayBuffer()));
+  mod.loadState("/work/quick.zip");
+  if (!(await waitState())) throw new Error("Não foi possível carregar o estado.");
 }
 
 // ---- Persistent JIT block cache -------------------------------------------------------------

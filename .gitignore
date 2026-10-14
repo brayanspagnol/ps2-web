@@ -1,5 +1,6 @@
 # Emulator source lives in its own repo (fork of jpd002/Play-)
 /play-src/
+/play-*/
 
 # The user's own game dumps never go into the repo
 /games/*

@@ -22,6 +22,7 @@
   #hud button { font: inherit; color: var(--fg); background: rgba(12,14,20,.72); border: 1px solid var(--line);
     border-radius: 999px; padding: 9px 16px; min-height: 40px; cursor: pointer; backdrop-filter: blur(8px); }
   #hud button:hover { background: rgba(40,48,70,.8); }
+  #hud button:disabled { opacity: .45; cursor: default; }
   #hud button:focus-visible { outline: 2px solid #5aa9ff; outline-offset: 2px; }
   #fps, #msg { font: 12px ui-monospace, monospace; color: var(--muted); padding: 0 6px; }
   #msg { position: fixed; z-index: 3; left: 16px; right: 16px; top: 16px; text-align: center; font-size: 14px; color: var(--fg); }
@@ -38,6 +39,8 @@
 <p id="msg" role="status" aria-live="polite"></p>
 <div id="hud" hidden>
   <button type="button" id="b-lib">Trocar jogo</button>
+  <button type="button" id="b-save" title="Salva o ponto atual deste jogo (F5)">Salvar</button>
+  <button type="button" id="b-load" title="Volta para o último ponto salvo (F8)">Carregar</button>
   <button type="button" id="b-fs">Tela cheia</button>
   <button type="button" id="b-crt" aria-pressed="true">Efeito CRT: ligado</button>
   <span id="fps"></span>
@@ -104,6 +107,7 @@
 
   function showHud() {
     $("hud").hidden = false;
+    emu.hasSavedState().then((has) => ($("b-load").disabled = !has));
     emu.takeFrames();
     clearInterval(fpsTimer);
     fpsTimer = setInterval(() => { $("fps").textContent = `${emu.takeFrames()} FPS`; }, 1000);
@@ -112,6 +116,30 @@
 
   $("b-lib").addEventListener("click", () => { if (!busy) { busy = true; backToLibrary().finally(() => (busy = false)); } });
   $("b-fs").addEventListener("click", () => tv.enterFullscreen());
+
+  async function quickState(save) {
+    if (busy) return;
+    busy = true;
+    msg(save ? "Salvando…" : "Carregando…");
+    try {
+      await (save ? emu.saveState() : emu.loadState());
+      msg(save ? "Estado salvo." : "Estado carregado.");
+      $("b-load").disabled = false;
+      setTimeout(() => msg(""), 2500);
+    } catch (e) {
+      msg(e.message, true);
+    } finally {
+      busy = false;
+      $("outputCanvas").focus();
+    }
+  }
+  $("b-save").addEventListener("click", () => quickState(true));
+  $("b-load").addEventListener("click", () => quickState(false));
+  addEventListener("keydown", (e) => {
+    if ($("hud").hidden || e.repeat) return;
+    if (e.key === "F5") { e.preventDefault(); quickState(true); }
+    else if (e.key === "F8") { e.preventDefault(); quickState(false); }
+  }, true);
   $("b-crt").addEventListener("click", (e) => {
     const on = e.currentTarget.getAttribute("aria-pressed") !== "true";
     tv.setCrtEffect(on);
