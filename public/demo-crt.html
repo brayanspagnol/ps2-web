@@ -59,7 +59,7 @@
   scene.add(floor);
 
   const style = new URLSearchParams(location.search).get("style") || "grey";
-  const tv = createCrtTv({ sourceCanvas: document.getElementById("outputCanvas"), style });
+  const tv = createCrtTv({ sourceCanvas: document.getElementById("outputCanvas"), frameId: emu.frameId, style });
   scene.add(tv.object3d);
   window.demo = { tv, renderer, scene, camera }; // handy for debugging from the console
 

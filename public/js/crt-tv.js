@@ -2,16 +2,13 @@
 // is shown live on the tube through a CRT shader, and the same shader doubles
 // as a full-viewport post-process for the fullscreen mode.
 //
-// Frame copy (emulator WebGL2 canvas -> three texture):
-// the emulator draws into its own WebGL2 context with preserveDrawingBuffer=false.
-// We wrap that canvas in a plain THREE.Texture and set needsUpdate once per
-// update(), i.e. a GPU-side texImage2D(canvas) from inside our own rAF, after the
-// emulator's task already ended. Chromium serves an already-presented WebGL
-// canvas from its front buffer (the last composited frame), so the copy never
-// sees the cleared back buffer. Measured in Brave 151 with wLaunchELF: no black
-// or flickering frames, live updates, ~0.16 ms extra per frame for the upload
-// (update+render+gl.finish 0.60 -> 0.76 ms), emulator stays at 59-60 fps, same
-// as test.html. A drawImage into a 2D canvas works too but adds a copy for nothing.
+// Frame copy (emulator canvas -> three texture): a plain THREE.Texture over the
+// source canvas, re-uploaded (GPU-side texImage2D) from our rAF when frameId()
+// reports a new frame. Current emulator builds render on their own GS thread
+// (OffscreenCanvas) and hand each finished frame to #outputCanvas as an
+// ImageBitmap ("bitmaprenderer"), so the canvas only ever holds whole frames.
+// Older builds drew into a WebGL canvas through GL calls proxied to the main
+// thread; a copy taken between their clear and their draw showed a black frame.
 // The source canvas is hidden with opacity:0.01 under the page (still rendered,
 // presented and focusable; display:none / visibility:hidden would break focus).
 // Caveat: in a background tab rAF stops, so the TV freezes there (as expected).
@@ -240,7 +237,9 @@ function sampleKeys(keys, t) {
   return keys[keys.length - 1].slice(1);
 }
 
-export function createCrtTv({ sourceCanvas, width = 0.7, style = "grey" } = {}) {
+// frameId (optional): returns an id that changes when the source has a new frame (null = unknown);
+// the texture is only re-uploaded then. Without it the source is uploaded every frame.
+export function createCrtTv({ sourceCanvas, frameId, width = 0.7, style = "grey" } = {}) {
   if (!sourceCanvas) throw new Error("createCrtTv: sourceCanvas é obrigatório.");
 
   const tex = new THREE.Texture(sourceCanvas);
@@ -258,6 +257,7 @@ export function createCrtTv({ sourceCanvas, width = 0.7, style = "grey" } = {}) 
   };
   const screenMaterial = new THREE.ShaderMaterial({ uniforms, vertexShader: VERT, fragmentShader: CRT_FRAG });
   const { group: model, screen, ledMat } = buildBody(style, screenMaterial);
+  screen.layers.enable(1); // console-scene's LIVE_LAYER: redrawn without the rest of the scene
   model.scale.setScalar(width / BASE_W);
   const object3d = new THREE.Group();
   object3d.name = "crt-tv";
@@ -289,7 +289,7 @@ export function createCrtTv({ sourceCanvas, width = 0.7, style = "grey" } = {}) 
   document.addEventListener("keydown", onKey, true);
   document.addEventListener("keyup", onKey, true);
 
-  let powered = false, signal = false;
+  let powered = false, signal = false, lastFrameId = null;
   let anim = null; // { keys, t, resolve }
 
   function setPower(on) {
@@ -349,6 +349,7 @@ export function createCrtTv({ sourceCanvas, width = 0.7, style = "grey" } = {}) 
     document.body.append(fs.el);
     fs.active = true;
     fs.idle = 0;
+    fs.drawn = false;
     screen.visible = false; // TV is hidden behind the overlay; avoid a second upload
     try {
       await fs.el.requestFullscreen({ navigationUI: "hide" });
@@ -372,8 +373,11 @@ export function createCrtTv({ sourceCanvas, width = 0.7, style = "grey" } = {}) 
   document.addEventListener("fullscreenchange", onFsChange);
 
   // ---- per frame ---------------------------------------------------------------
+  // Returns false when the screen looks the same as last frame (no new emulator frame, no animation),
+  // so the caller can skip redrawing it.
   function update(dt /* , renderer */) {
     uniforms.time.value += dt;
+    let changed = !!anim || (powered && !signal); // power animation / static noise move every frame
     let p;
     if (anim) {
       anim.t += dt;
@@ -384,19 +388,27 @@ export function createCrtTv({ sourceCanvas, width = 0.7, style = "grey" } = {}) 
     }
     uniforms.power.value.set(p[0], p[1], p[2]);
 
-    // Upload the emulator's latest frame only when it can be seen.
-    if (signal && (powered || anim)) tex.needsUpdate = true;
+    // Upload the emulator's latest frame only when it can be seen and is new.
+    if (signal && (powered || anim)) {
+      const id = frameId?.() ?? null;
+      if (id === null || id !== lastFrameId) { tex.needsUpdate = true; changed = true; }
+      lastFrameId = id;
+    }
 
     if (fs.active) {
       const r = fs.renderer;
       const w = fs.el.clientWidth, h = fs.el.clientHeight;
       const size = r.getSize(new THREE.Vector2());
-      if (size.x !== w || size.y !== h) r.setSize(w, h, false);
+      const resized = size.x !== w || size.y !== h || !fs.drawn;
+      if (resized) r.setSize(w, h, false);
       r.getDrawingBufferSize(uniforms.viewRes.value);
       fs.idle += dt;
       if (fs.idle > 2.5) { fs.bar.style.opacity = "0"; fs.el.style.cursor = "none"; }
-      r.render(fs.scene, fs.cam);
+      // An undrawn WebGL canvas keeps showing its last frame.
+      if (changed || resized) { r.render(fs.scene, fs.cam); fs.drawn = true; }
+      return false; // the TV screen is hidden behind the overlay
     }
+    return changed;
   }
 
   function dispose() {

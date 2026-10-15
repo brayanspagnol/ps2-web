@@ -56,9 +56,9 @@
   const msg = (text, err = false) => { $("msg").textContent = text; $("msg").className = err ? "err" : ""; };
 
   const view = createConsoleScene($("stage"));
-  const tv = createCrtTv({ sourceCanvas: $("outputCanvas") });
+  const tv = createCrtTv({ sourceCanvas: $("outputCanvas"), frameId: emu.frameId });
   view.tvAnchor.add(tv.object3d);
-  view.onFrame((dt) => tv.update(dt, view.renderer)); // keeps the scene rendering every frame for the live TV
+  view.onFrame((dt) => tv.update(dt, view.renderer)); // runs every frame for the live TV (only the screen is redrawn)
 
   // Load the emulator in the background while the user browses the shelf.
   const emuReady = emu.init();

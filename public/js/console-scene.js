@@ -19,6 +19,8 @@ import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
 import { RoundedBoxGeometry } from "three/addons/geometries/RoundedBoxGeometry.js";
 import { mergeGeometries } from "three/addons/utils/BufferGeometryUtils.js";
 
+// Layer of objects that redraw every frame (the TV screen, see frame()).
+export const LIVE_LAYER = 1;
 const MM = 0.001;
 const TV_POS = new THREE.Vector3(0, 0, -0.44);
 // What focusTv() keeps in view, in TV-anchor space: tube + bezel (crt-tv.js:
@@ -54,7 +56,9 @@ const ease = {
 
 export function createConsoleScene(container, opts = {}) {
   // ---------- renderer / scene ----------
-  const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
+  // preserveDrawingBuffer: while nothing but the live layer changes, frames only redraw that layer
+  // over the previous one (see frame()).
+  const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance", preserveDrawingBuffer: true });
   renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, opts.maxPixelRatio ?? 2));
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
@@ -276,25 +280,45 @@ export function createConsoleScene(container, opts = {}) {
   // ---------- render loop (on demand) ----------
   const tweens = new Set();
   const frameCbs = new Set();
-  let raf = 0, last = 0, disposed = false;
+  let raf = 0, last = 0, disposed = false, fullRender = true;
 
+  // Objects on LIVE_LAYER (besides layer 0) change on their own (the TV screen). When no tween runs and
+  // nothing called invalidate(), only they are redrawn over the last full frame, and only if an onFrame
+  // callback did not return false: the full scene (shadows, physical materials, MSAA) costs GPU time
+  // the emulator needs while playing.
   function frame(now) {
     raf = 0;
     if (disposed) return;
     const dt = last ? Math.min((now - last) / 1000, 0.1) : 0;
     last = now;
+    const full = fullRender || tweens.size > 0;
+    fullRender = false;
     for (const tw of [...tweens]) {
       const p = Math.min((now - tw.t0) / tw.ms, 1);
       tw.fn(tw.ease(p));
       if (p >= 1) { tweens.delete(tw); tw.done(); }
     }
-    for (const cb of frameCbs) cb(dt);
+    let live = false; // a callback returning false means its live objects did not change
+    for (const cb of frameCbs) if (cb(dt) !== false) live = true;
     applyCamera();
-    renderer.render(scene, camera);
+    if (full) {
+      renderer.render(scene, camera);
+    } else if (live) {
+      renderer.autoClear = false;
+      scene.background = null; // a Color background always clears
+      camera.layers.set(LIVE_LAYER);
+      renderer.render(scene, camera);
+      camera.layers.set(0);
+      scene.background = bg;
+      renderer.autoClear = true;
+    }
     if (tweens.size || frameCbs.size) raf = requestAnimationFrame(frame);
     else last = 0;
   }
-  function invalidate() { if (!raf && !disposed) raf = requestAnimationFrame(frame); }
+  function invalidate() {
+    fullRender = true;
+    if (!raf && !disposed) raf = requestAnimationFrame(frame);
+  }
 
   function tween(ms, fn, easing = ease.inOut) {
     return new Promise((done) => {

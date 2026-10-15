@@ -41,7 +41,18 @@ export async function init() {
   });
   mod.FS.mkdir("/work");
   mod.discImageDevice = new DiscImageDevice(mod);
+  // The GS thread renders on its own OffscreenCanvas and sends every frame here as an ImageBitmap.
+  // Builds before that create a WebGL context on #outputCanvas in initVm (so "bitmaprenderer" is null)
+  // and draw into it themselves.
+  let firstFrame;
+  const gsReady = new Promise((r) => (firstFrame = r));
+  mod.onGsFrame = (bitmap) => {
+    out.transferFromImageBitmap(bitmap);
+    if (gsFrames++ === 0) firstFrame();
+  };
   mod.ccall("initVm", "", [], []);
+  const out = document.getElementById("outputCanvas").getContext("bitmaprenderer");
+  if (out) await gsReady; // the GS thread sets up its context once initVm returned; boot after that
   return mod;
 }
 
@@ -73,6 +84,13 @@ export async function boot(file, { blockCache = true } = {}) {
   }
   document.getElementById("outputCanvas").focus();
 }
+
+// The Play! module (debugging / measurements from the console), or null before init().
+export const getModule = () => mod;
+
+// Changes whenever #outputCanvas gets a new frame; null when unknown (older builds draw into it directly).
+let gsFrames = 0;
+export const frameId = () => gsFrames || null;
 
 // Frames presented since the previous call; call once per interval to get FPS.
 export function takeFrames() {
