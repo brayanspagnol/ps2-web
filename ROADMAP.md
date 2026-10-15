@@ -21,6 +21,10 @@ Update 2026-10-15: VU JIT context promotion (~1.25x VU1), FFX freeze fix (LQC2/S
 own WebGL context on an OffscreenCanvas (frames to the page as ImageBitmap: no black flashes, main thread
 3-7% busy) and a site that only redraws the TV screen while playing. GTA SA ~28-32 vbl/s in free roam, ~40-45
 in the intros; FFX intro 37 (site) with drops. EE block chaining/context promotion gave no gain (off).
+Update 2026-10-15 evening: public/emu rolled back to fbed76d8 because the OffscreenCanvas GS build
+(3925aa4b, web-perf HEAD) hangs the page main thread during GTA's intro movies on a cold boot (being fixed
+on branch site-gs, notes/gs-hang.md). ee-jit (f08f5db1: module batching, page-table memory ops, dispatch via
+index table) is ready: -12% ms/vbl on play.zip/car.zip, ~+18% in-game; integrate after the GS hang fix.
 In progress (fork branches, see notes/): `vu-jit` (VU codegen: context promotion, differential test,
 VU1 replay benchmark), `ee-jit` (EE dispatcher/block linking/traces — the GTA bottleneck).
 Next: finish ee-jit and vu-jit, merge into web-perf with ABAB measurements, then Phase 3 traces.
