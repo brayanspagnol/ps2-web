@@ -66,6 +66,8 @@
     const size = Number((await fetch(url, { method: "HEAD" })).headers.get("content-length"));
     // &vujit=<promotion 0|1>,<diff 0|1>[,<name JIT functions 0|1>]: VU JIT debug options (builds that export setVuJitOptions)
     // &eechain=0: compile EE blocks without block chaining (builds that export setEeBlockChaining)
+    // &eepromo=0: EE blocks without context promotion (builds that export setEeContextPromotion)
+    if (q.get("eepromo") && mod.setEeContextPromotion) mod.setEeContextPromotion(q.get("eepromo") !== "0");
     if (q.get("eechain") && mod.setEeBlockChaining) mod.setEeBlockChaining(q.get("eechain") !== "0");
     if (q.get("vujit") && mod.setVuJitOptions) { const [p, d, n] = q.get("vujit").split(",").map(Number); mod.setVuJitOptions(!!p, !!d, !!n); }
     // &vusb=0|1: VU superblocks (builds that export setVuSuperBlocks)
@@ -76,6 +78,8 @@
     if (q.get("vu1thread") === "0") mod.setVu1Threaded(false);
     // &nolimit=1: frame limiter off (CPU per emulated vblank measurements)
     if (q.get("nolimit") === "1") mod.setFrameLimit(false);
+    // &time=from,to: wall ms between vblanks [from, to) after the state load (mod.eeTimeResult())
+    if (q.get("time") && mod.eeTimeAfterLoad) { const [a, b] = q.get("time").split(",").map(Number); mod.eeTimeAfterLoad(a, b); }
     if (q.get("hash") && mod.eeHashAfterLoad) mod.eeHashAfterLoad(Number(q.get("hash")));
     if (q.get("state")) {
       await sleep(1500);
