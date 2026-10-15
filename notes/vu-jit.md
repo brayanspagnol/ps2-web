@@ -1,7 +1,7 @@
 # VU JIT on WebAssembly (Phase 3) — work notes
 
 Branch `vu-jit` in worktree `play-vujit` (pushed to `fork`). CodeGen submodule commits are on its
-local branch `vu-jit` (upstream remote only, not pushed); same changes as `notes/vu-jit-codegen.patch`
+local branch `vu-jit`, pushed to `fork` (https://github.com/brayanspagnol/Play--CodeGen.git); same changes as `notes/vu-jit-codegen.patch`
 (apply with `git am` inside deps/CodeGen).
 
 ## Findings
@@ -39,21 +39,40 @@ local branch `vu-jit` (upstream remote only, not pushed); same changes as `notes
 - In-game GTA play.zip release fps: vujitbase 20-22, vujit 20 (noise; not yet measured on a quiet machine).
   car.zip / FFX: not measured yet.
 
-## In progress (uncommitted-quality WIP in the last commit)
-VU superblocks (idea 3): CVuBasicBlock::CompileSuperBlock compiles several VU blocks into one function: dispatch
-loop on (nPC - entry nPC) using only Jitter ifs + its single loop; each part = normal block body + epilogue;
-back edges goto the loop, forward parts fall through, anything else returns. Part counter in m_jitFlagScratch[3]
-for the differential test (CVuBasicBlock::ExecuteDiff runs N reference blocks one by one).
-NOT DONE / NOT BUILT yet:
-- CVuExecutor: factor block-end computation out of PartitionFunction (FindBlockEnd), plan parts in BlockFactory
-  (BFS from head over static successors, parts inside [head, head+0x1000), <=16 parts; skip blocks with
-  compile hints/no-clamping keys, branch-in-delay-slot and E-bit-in-delay-slot blocks), key/hash over
-  [head, maxEnd], SetSuperBlockParts, SetReferenceBlockProvider (map of reference blocks compiled with
-  m_forceReference, cleared in ClearActiveBlocksInRange/Reset), m_diffDataSize.
-- Global toggle (g_vuSuperBlocks) + bench param; build; diff test; replay A/B.
+## 2026-10-15: merged web-perf (MTVU), superblocks finished
+- Merge commit fff360f2 on `vu-jit` (pushed to `fork`); CodeGen unchanged (627e10e, branch `vu-jit` pushed to `fork`).
+- MTVU: the VU1 thread's executor compiles with the same promoted codegen (thread_local jitter); diff-test state is
+  thread_local. Replay benchmark runs on the VU1 thread when threaded (capture TOP/ITOP read through the VU memory map).
+- Bug found: the executor's *empty block* was compiled for the diff test; it runs the real block, so diff mode ran
+  blocks twice and kicked GIF packets twice -> with VU1 threaded the GIF got stuck on a bogus PATH1 packet and the VM
+  thread blocked in CVu1Thread::Reserve (ring full). Fixed (empty block never diffed). Side finding (not changed): MTVU
+  can deadlock if the VU1 thread stalls on the GIF waiting for data the VM thread has not pushed yet while the ring is
+  full (Reserve blocks the VM thread). Only seen with this bug, but a stalled-DMA fallback in CVif/CGIF::ReceiveDMA
+  (return 0 when the ring lacks room) would make it robust.
+- Superblocks (executor side done): planning in CVuExecutor::PartitionFunction (BFS over static successors, <=16 parts,
+  inside [entry, entry+MAX_BLOCK_SIZE)), reference-block provider for the diff test (reference blocks without self
+  loops), `Module.setVuSuperBlocks(bool)` / bench `&vusb=1`, default OFF.
+- Diff test (GTA play.zip, release): VU1 threaded 5.06M block runs / 0 mismatches; unthreaded 12.1M / 0;
+  superblocks threaded 205k superblock runs / 0, unthreaded 222k / 0. Replay hashes: 0 mismatches every round.
+- Replay (us/program, quietest run, rounds alternate): reference 33.9/32.0, promoted 26.0/25.9, superblocks 28.7/28.7.
+  Superblocks are ~10% SLOWER than plain promoted blocks (4-part cap: no better within noise). Likely cause: the
+  dispatch loop makes every promoted local loop-carried (big v128 phi sets in TurboFan) and the union of promoted
+  symbols is stored/reloaded around every helper call and at exit.
+- CPU profile (GTA free roam, release + names, threaded): VM thread VU0 JIT 0.4% (the VUBLOCK zone in PROFILE builds is
+  mostly profiler overhead); VU1 thread ~59% busy: VU1 JIT 31%, VU dispatcher (CGenericMipsExecutor::Execute) 5.2%,
+  GIF 1.9%, BlockFactory 1.2%. => the most superblocks could save is ~5% of the VU1 thread, and the VU1 thread is
+  not the bottleneck in GTA (VM/EE thread is).
+- In-game ABAB (release, warm cache, median vbl/s t=15-45 s, machine loaded 3-8 by other agents -> noisy):
+  FFX mtvu-ffx.zip: public/emu (web-perf) 25, 32 vs emu-vujit 36, 30; GTA car.zip: emu 4 (stall outlier), 20 vs
+  emu-vujit 20, 24. No regression; no gain measurable above noise (expected: VU1 thread is not the limit).
+- Variants: public/emu-vujit (release, superblocks off, `&vusb=1` to enable), emu-vujitprof, emu-vujitnames.
+  bench.html: new `&vusb=0|1`. Scripts: scratchpad vujit/ (vj.mjs, run.sh, replay.sh, abab.sh, profagg.mjs).
+- PROFILE builds: vuBlocks / "blocks/program" counter is meaningless with VU1 threaded (exchanged by getProfile on
+  another thread), and per-block zone swaps inflate VU time a lot.
 
 ## Next steps
-1. Finish superblocks as above; verify 0 mismatches; measure replay + PROFILE VUBLOCK.
+1. Superblocks: only worth retrying with a different shape (e.g. wasm tail calls between blocks like ee-jit, or
+   superblocks limited to loops whose parts share most symbols); not a priority while VU1 is not the bottleneck.
 2. Then: measure EE effect of the helper-call fix; consider promotion for EE blocks (needs diff harness for EE).
 3. Flag ring writes: only last <=5 entries matter for later queries (needs query-equivalence diff instead of
    byte equality).

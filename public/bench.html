@@ -65,9 +65,18 @@
     const url = new URL("games/" + encodeURIComponent(game), location.href).href;
     const size = Number((await fetch(url, { method: "HEAD" })).headers.get("content-length"));
     // &vujit=<promotion 0|1>,<diff 0|1>[,<name JIT functions 0|1>]: VU JIT debug options (builds that export setVuJitOptions)
+    // &eechain=0: compile EE blocks without block chaining (builds that export setEeBlockChaining)
+    if (q.get("eechain") && mod.setEeBlockChaining) mod.setEeBlockChaining(q.get("eechain") !== "0");
     if (q.get("vujit") && mod.setVuJitOptions) { const [p, d, n] = q.get("vujit").split(",").map(Number); mod.setVuJitOptions(!!p, !!d, !!n); }
+    // &vusb=0|1: VU superblocks (builds that export setVuSuperBlocks)
+    if (q.get("vusb") && mod.setVuSuperBlocks) mod.setVuSuperBlocks(q.get("vusb") === "1");
     if (q.get("blockcache") === "clear") await emu.clearBlockCache(`${game}-${size}`);
     await emu.boot({ name: game, size, url, slice: () => { throw new Error("url only"); } }, { blockCache: q.get("blockcache") !== "0" });
+    // &vu1thread=0: VU1 on the VM thread; &hash=N: hashes of EE/IOP state+RAM at the first N vblanks after the state load (mod.eeHashResult())
+    if (q.get("vu1thread") === "0") mod.setVu1Threaded(false);
+    // &nolimit=1: frame limiter off (CPU per emulated vblank measurements)
+    if (q.get("nolimit") === "1") mod.setFrameLimit(false);
+    if (q.get("hash") && mod.eeHashAfterLoad) mod.eeHashAfterLoad(Number(q.get("hash")));
     if (q.get("state")) {
       await sleep(1500);
       try { await bench.load(q.get("state")); status.textContent = "state loaded"; }
