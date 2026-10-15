@@ -1,4 +1,4 @@
-# PS2 na Sala
+# PS2 WEB
 
 Play PlayStation 2 games in the browser, with nothing to install.
 
