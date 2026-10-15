@@ -1,45 +1,125 @@
 # EE JIT speedups (branch `ee-jit`, worktree `play-eejit/`) - working notes
 
-Status (2026-10-14): analysis done, no code changed yet. Branch `ee-jit` = web-perf (a258e78b).
-Build dir configured: `play-eejit/build_cmake/build/rel` (release, -msimd128); first build was interrupted
-(machine shutdown), just rerun `nice -n 19 cmake --build build_cmake/build/rel --config Release --target Play -j4`.
+Status (2026-10-15 evening): module batching + page-table memory ops + index-table dispatch are ON by default
+(-12% ms/vbl play.zip, -11% car.zip, in-game 34 -> 40 vbl/s); see "Session 2" below. Block chaining and EE
+context promotion are correct but slower, OFF by default. Branch `ee-jit`
+contains web-perf (merged at fbed76d8, incl. vu-jit). CodeGen submodule branch `ee-jit` (fork) = vu-jit's
+627e10e + 9038252 (indirect tail call op).
 
-## Findings (code reading)
+## Commits
+- bc145720 JIT helper calls without JS (CodeGen 627e10e + Ps2VmJs passes function pointers). Measured: no
+  difference (VM-thread CPU ms/vbl, play.zip: 44.6/47.4/43.6 base vs 44.9/47.0/43.8).
+- 4059d2b2 block chaining (wasm `return_call_indirect`), state-hash checkpoints.
+- 0c64428c EE context promotion switch, vblank-range timer, defaults off.
 
-1. **Every JIT -> C++ helper call goes through a JS wrapper** (likely the "js-to-wasm" ~8% of the VM thread).
-   `RegisterExternFunction` (deps/CodeGen/src/Jitter_CodeGen_Wasm.cpp, EM_JS) reads `Module[fctName]` at
-   startup. In emsdk 4.0.1 output, `Module["_X"]` is a lazy JS arrow `(a0,a1)=>(_X=Module["_X"]=wasmExports["ld"])(a0,a1)`
-   until first called, so `convertJsFunctionToWasm` wraps a JS function: each memory slow-path call
-   (MemoryUtils_*Proxy, LWL/LWR/..., EmptyBlockHandler) is wasm->JS->wasm.
-   Fix without touching CodeGen: in `Source/ui_js/Ps2VmJs.cpp`, before registering (and in
-   `CVu1Thread::ThreadInitHandler`), set `Module[name] = wasmTable.get(functionPtr)` via EM_ASM
-   (a C++ function pointer is its index in `wasmTable`), so the import table holds the raw wasm function.
-   Verify in a CDP profile that js-to-wasm disappears.
+## Design (as implemented)
+- `BlockLookupTwoWay` keeps a parallel two-level table of wasm function-table indexes (missing subtables
+  share a static all-zero one); `CMIPS::m_blockFnLookup` points to it (EE only, set in CEeExecutor ctor).
+- `CBasicBlock::CompileEpilog`: if `nHasException == 0` after nPC is updated, load
+  `fn[(nPC>>16)&0x1FFF][(nPC>>2)&0x3FFF]` and `JumpToIndirect()` (new CodeGen op OP_EXTERNJMP_IDX: `if(idx)
+  return_call_indirect (type vi) table 1`; table 1 = `env.blockTable` = main `wasmTable`, imported only by
+  functions that use it). Index 0 -> return to the dispatcher (compiles there). Same semantics as one more
+  executor loop iteration; nPC == running block start, so write-protection invalidation stays correct.
+- EE context promotion: `UsesContextPromotion()` also true for EE when enabled (CodeGen 5ca6ca6/e44a2cf;
+  functions taking unregistered context references are not promoted, so it is safe by construction).
+- Switches (applied to blocks compiled afterwards, part of the block cache key):
+  `Module.setEeBlockChaining(bool)`, `Module.setEeContextPromotion(bool)`; bench `&eechain=1&eepromo=1`.
 
-2. **Dispatcher (CEeExecutor::Execute ~23%)**: wasm blocks always return to
-   `CGenericMipsExecutor::Execute`; native link slots are disabled on wasm (`CBasicBlock::LinkBlock` is
-   `#if !__EMSCRIPTEN__`, epilog skips `JumpToDynamic`). Wasm code is immutable, so patching is not an option.
-   Planned design ("inline dispatch" with tail calls, no link bookkeeping):
-   - `BlockLookupTwoWay` keeps a parallel two-level table of wasm function-table indices
-     (`uint32* fn[0x2000]`, missing subtables point to one shared static all-zero subtable so generated code
-     needs no null check). AddBlock stores `block->m_function.GetCode()` (= table index), DeleteBlock/Clear zero it.
-   - `CMIPS` gets `uint32** m_blockFnLookup` (+ mask), set only by `CEeExecutor` (EE only; IOP could follow).
-   - `CBasicBlock::CompileEpilog` (wasm, when m_blockFnLookup set): after nPC is updated and if
-     `nHasException == 0` (already covers quota via QUOTADONE, syscalls, idle blocks):
-     `PushRelRef(m_blockFnLookup); nPC & mask >> 16; LoadRefFromRefIdx; (nPC & 0xFFFC); LoadFromRefIdx(1); JumpToIndirect()`.
-   - CodeGen (commit on branch `ee-jit` inside deps/CodeGen, keep small): new op `OP_EXTERNJMP_IDX`
-     (Jitter::JumpToIndirect pops an i32): wasm emits `local idx; if; ctx; idx; return_call_indirect (type vi) table 1; end`
-     (zero = fall through, return to dispatcher; empty block -> 0 so compiles happen in the dispatcher, no nesting).
-     WasmModuleBuilder imports a 2nd table `env.blockTable`; MemoryFunction.cpp `WasmCreateFunction` passes
-     `blockTable: wasmTable`. Add op to RegAlloc spill exceptions and Jitter_Statement dump.
-   - Correctness: during a chain nPC == begin of the executing block (epilog sets nPC before the tail call),
-     so `ClearActiveBlocksInRange(executing=true)` still protects the right block; previous blocks have no
-     frames (tail calls). Lookup-based chaining is semantically identical to the dispatcher loop (also for JR).
-     Block cache: generated bytes embed offsetof/mask only (per-build salt covers it).
-3. Later: superblocks/context promotion, RAM fast paths, VIF1 front batching (see task list in ROADMAP.md).
+## Test tooling (bench.html + Main.cpp)
+- `&hash=N` -> `Module.eeHashAfterLoad(N)`: XXH3 of EE MIPSSTATE+RAM+SPR and IOP state+RAM at each of the
+  first N vblanks after the state load (CPS2VM::OnStateLoaded); `mod.eeHashResult()`. With `&vu1thread=0` the
+  emulation is deterministic: play.zip/FFX identical every run; car.zip identical in 6 of 7 runs (one
+  outlier with the OLD codegen, i.e. pre-existing rare nondeterminism).
+- `&time=from,to` -> wall ms between vblanks [from,to) after load (`mod.eeTimeResult()`); with
+  `&vu1thread=0&nolimit=1` the workload is identical across runs.
+- `&nolimit=1` frame limiter off; `&vu1thread=0` VU1 on the VM thread.
+- Scratchpad tools: cdprun.mjs (CDP runner, worker CPU profiles, per-thread CPU from /proc), profagg/tree/
+  parents.mjs (cpuprofile analysis), tbench.sh (alternating deterministic timing), cpuab.sh, linknames.sh
+  (relink release with --profiling-funcs).
 
-## Next steps
-1. Build baseline rel + names build (`-DCMAKE_EXE_LINKER_FLAGS="-msimd128 --profiling-funcs"`) and deploy to
-   public/emu-eejitbase/ ; take CDP profile of the VM thread on play.zip (tools in scratchpad/mtvu/cdpprof.mjs).
-2. Implement fix 1, measure (ABAB, warm cache), commit.
-3. Implement fix 2, check GTA boot past intros, play.zip/car.zip/FFX, measure, commit; deploy public/emu-eejit/.
+## Correctness
+- Hashes identical chaining on/off and promotion on/off: play.zip, car.zip, FFX (300 vblanks each).
+- GTA boots from scratch past the intro movies to the 3D cutscene (chaining on, 280 s). play.zip renders,
+  FFX (mtvu-ffx.zip) runs 110 s at ~56-58 vbl/s with both switches on (merged build).
+
+## Measurements (play.zip)
+- In-game ABAB vbl/s: unusable today (load 5-18 from other work; same build varied 4..30 vbl/s).
+- Deterministic timing, vblanks 100-700, VU1 on VM thread, no limiter, ms/vbl over 4 alternating rounds:
+  neither 46.8/53.7/44.8/45.1 (median 46.0), chaining 51.9/51.1/45.8/50.1 (50.6),
+  chaining+promotion 56.0/48.2/49.3/50.0 (49.7). Spread +-10% even here; no gain visible, chaining maybe worse.
+- VM-thread CPU ms/vbl (MTVU off), chaining off vs on (same build): 42.7/39.7, 39.2/39.4, 40.9/39.8 (~-2%).
+
+## Profiles (release + --profiling-funcs, CDP, VM worker)
+- Step 1 (MTVU on): JIT blocks 43% self, EmuThread 22.8% self (dispatcher inlined), SyncVu1 wait 9%
+  (VM waits for the VU1 thread at vblank: VU1 thread is co-bottleneck in GTA), DMA from JIT stores 8.4%,
+  steady-state block compiles 4% (real Jitter runs, not cache hits - unexplained, check with a PROFILE build).
+- No `wasm-to-js` between JIT code and memory helpers any more. The remaining `js-to-wasm:*` self time sits
+  in the thread entry frame (invoke_vi from __thread_proxy), most likely a sampling attribution artifact,
+  not real overhead.
+- Chaining (MTVU off): EmuThread self 5.9%, JIT 64% (EE+VU); dispatcher time moved into JIT frames.
+  Interpretation: dispatch was cheap already; V8 cross-instance call/tail call cost is similar either way.
+
+## Next
+1. Find why blocks are recompiled in steady state (PROFILE build: compiles vs cacheHits; m_cachedBlocks).
+2. The JIT code itself dominates: measure per-block hot spots (ee_* names via vu-jit name section) and look
+   at codegen quality (memory fast path, 64-bit GPR ops); bigger superblocks/traces would need real
+   register allocation across blocks to pay off.
+3. VU1 thread is close to saturated in GTA (SyncVu1 waits), so EE-only gains are capped.
+4. Re-measure chaining/promotion on a quiet machine with tbench.sh (more rounds) before deleting them.
+
+## Session 2 (2026-10-15 afternoon): codegen analysis, batching, page ops
+Branch `ee-jit` = f08f5db1 (Play) / d8c5b47 (CodeGen), web-perf 3925aa4b merged (10746098). Pushed to `fork`.
+
+### Findings (GTA play.zip)
+- Profile is flat: 8.6k distinct EE blocks, top 60 = 16% of EE JIT time. PROFILE counters: ~4.5M blocks/s,
+  ~32M instructions/s, 7.2 instructions per block.
+- Old codegen (25 hottest blocks, wasm-dis): 30 wasm ops per MIPS instruction, 3.6 context loads + 1.9 context
+  stores per instruction, 97 wasm bytes per instruction. 40% of the instructions are loads/stores and each was
+  ~50-70 ops: page lookup computed twice (Jitter stack must be empty across BeginIf), slow path inline with the
+  sign extension/stores duplicated, LQ/SQ slow path = 4 inline helper calls.
+- Store forwarding: 32-bit results stored as two i32 (lo, hi) then read with i64.load (BEQ/BNE compares, DADDU)
+  -> store-forwarding stall. Block harness (dumped blocks run in Brave against a fake context): -26% body time.
+- Many tiny modules: harness with 4096 real blocks called in random order: one module per block ~490 ns/call,
+  64 per module ~185 ns/call (V8 code locality: per-module code space + jump table). The cross-instance call
+  itself costs only ~3-4 ns more than a same-instance call.
+- Steady-state recompiles: none. 0 write-protection invalidations and 0 recompiles of the same address in free
+  roam; every steady-state Jitter run is code reached for the first time (persistent cache covers it next session).
+- CEeExecutor::Execute self time stays ~26-29% of the VM thread (likely dependent cache misses: lookup table ->
+  block -> V8 dispatch table -> jump table) and is not reduced by chaining.
+- Code size matters more than context traffic: EE context promotion on top of the new codegen cuts context
+  loads/stores to 0.92/0.35 per instruction but grows code to 154 bytes/instr (store/reload around every slow
+  path) and is 10-20% SLOWER. Chaining on top of batching: also slower (every round). Both stay off.
+
+### Changes (all hash-identical on play.zip, car.zip, mtvu-ffx.zip, 300 vblanks, VU1 on VM thread)
+- CodeGen: two 32-bit context stores of one 64-bit value -> one i64 store.
+- CodeGen: OP_LOADFROMPAGE/OP_STOREATPAGE (one wasm if/else per guest access, slow path handler registered with
+  CCodeGen_Wasm::SetPageAccessHandlers); front end uses them for LB..LD, SB..SD, LQ/SQ, LWC1/SWC1, LQC2/SQC2.
+  New codegen: 21.7 ops/instr, 2.35 ctx loads + 1.21 stores per instr, 72 bytes/instr. Bug found while doing it:
+  Jitter CSE merged two page loads with a store in between (page loads now excluded from CSE/copy propagation).
+  Switch: Module.setJitPageAccess(mask) / bench `&pageacc=0` (mask bits per access kind, debug).
+- CodeGen: canonical type numbering + CWasmModuleBuilder::BuildBatchModule; Play: EE module batching, 64 blocks
+  per module by default (Module.setEeBatchSize, bench `&eebatch=N`, 0 = off).
+- EE dispatch through the function index table; fall-through-only EE blocks skip the delayed-jump epilogue.
+- Tooling: `&eedump=addr,...` (wasm + disassembly of EE blocks), eeStateDump, component state hashes,
+  PROFILE counters (eeBlocks/eeInsns/eeInval/eeJit + compile/invalidation log), `eeTimeVblank()` for CPU-time
+  windows (scratchpad tools/cbench.sh: VM-thread CPU ms/vbl over the window, renderer pinned to P-cores).
+
+### Measurements (after the 15:45 power-profile switch; VU1 on VM thread, no limiter, vblanks 100-600, ms/vbl,
+5 alternating rounds, wall / VM-thread CPU medians; variants emu-eeqbase3 = pre-session ee-jit + web-perf,
+emu-eeqg = f08f5db1)
+| config | play.zip | car.zip |
+|---|---|---|
+| base (eeqbase3) | 38.97 / 38.66 | 47.92 / 47.29 |
+| batch64, no page ops (eeqg &pageacc=0) | 35.07 / 34.78 (-10%) | - |
+| page ops, no batch (eeqg &eebatch=0) | 36.99 / 36.64 (-5%) | - |
+| everything (eeqg) | 34.43 / 34.00 (-12%) | 42.85 / 42.27 (-11%) |
+(The batch/page rows also include store pairs, index-table dispatch and the fall-through epilogue, which were
+not measured alone.) In-game play.zip, MTVU on, limiter on, median vbl/s t=40-72 s: base 34, 34 -> eeqg 40, 40.
+
+### Open
+- Cold boot from scratch on the merged tree: the page stops updating during the intro movies (~22-60 s) with
+  emu-eeqg AND with the merged baseline emu-eeqbase3; the pre-merge build with batching (emu-eeqc &eebatch=64)
+  boots fine for 150 s. Points at the web-perf site-gs merge (OffscreenCanvas GS) in a background CDP tab, not
+  at the EE changes; needs checking by whoever owns site-gs.
+- Next levers: Execute self time (~29%): bigger compilation units (EE superblocks over PartitionFunction regions
+  without promotion), leaner branch epilogue (select instead of nDelayedJumpAddr store + reload).

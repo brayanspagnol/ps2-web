@@ -70,6 +70,12 @@
     if (q.get("eepromo") && mod.setEeContextPromotion) mod.setEeContextPromotion(q.get("eepromo") !== "0");
     if (q.get("eechain") && mod.setEeBlockChaining) mod.setEeBlockChaining(q.get("eechain") !== "0");
     if (q.get("vujit") && mod.setVuJitOptions) { const [p, d, n] = q.get("vujit").split(",").map(Number); mod.setVuJitOptions(!!p, !!d, !!n); }
+    // &eebatch=N: EE blocks per batch wasm module (0 = one module per block; builds that export setEeBatchSize)
+    if (q.get("eebatch") && mod.setEeBatchSize) mod.setEeBatchSize(Number(q.get("eebatch")));
+    // &pageacc=0: guest loads/stores with the older if/else Jitter sequence; a number = mask of access kinds (debug)
+    if (q.get("pageacc") && mod.setJitPageAccess) mod.setJitPageAccess(Number(q.get("pageacc")) >>> 0);
+    // &eedump=addr,addr,...: dump wasm + disassembly of these EE blocks when they compile (mod.eeDumpResult())
+    if (q.get("eedump") && mod.eeDumpRequest) mod.eeDumpRequest(q.get("eedump"));
     // &vusb=0|1: VU superblocks (builds that export setVuSuperBlocks)
     if (q.get("vusb") && mod.setVuSuperBlocks) mod.setVuSuperBlocks(q.get("vusb") === "1");
     if (q.get("blockcache") === "clear") await emu.clearBlockCache(`${game}-${size}`);
