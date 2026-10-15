@@ -1,7 +1,9 @@
 # Building Play! (WebAssembly) for ps2-web
 
-`public/emu/Play.js` + `Play.wasm` are built from source: upstream Play! (jpd002/Play-, commit d44bfa18)
-plus a gamepad patch (`play-gamepad.patch`). The upstream prebuilt from playjs.purei.org is kept in
+`public/emu/Play.js` + `Play.wasm` are built from the `web-perf` branch of the Play! fork
+(https://github.com/brayanspagnol/Play-), whose `deps/CodeGen` submodule points at
+https://github.com/brayanspagnol/Play--CodeGen. `play-gamepad.patch` is an older snapshot of the
+first changes against upstream commit d44bfa18, kept for reference. The upstream prebuilt from playjs.purei.org is kept in
 `public/emu-prebuilt/` as a fallback (to use it, copy its files back over `public/emu/`).
 
 ## Toolchain (one-time)
@@ -17,8 +19,7 @@ cmake and ninja come from the system (/usr/bin).
 
 ```sh
 cd ~/Projetos/ps2-web
-git clone --recursive https://github.com/jpd002/Play- play-src
-cd play-src && git apply ../play-gamepad.patch   # skip if already applied
+git clone --recursive -b web-perf https://github.com/brayanspagnol/Play- play-src
 ```
 
 ## Build (release, -O3 + wasm SIMD)
