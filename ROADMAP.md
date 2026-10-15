@@ -17,6 +17,10 @@ Shipped in public/emu (Play! fork, branch web-perf): stale-JIT fix (software wri
 detection, IPU IDCT, persistent JIT block cache, quick save/load, AudioWorklet audio with WSOLA
 time-stretching, VU1 on its own thread (MTVU). FFX intro 3D ~58/60 vbl/s; GTA SA free roam ~22-24/50
 (EE/VM thread bound).
+Update 2026-10-15: VU JIT context promotion (~1.25x VU1), FFX freeze fix (LQC2/SQC2), GS thread with its
+own WebGL context on an OffscreenCanvas (frames to the page as ImageBitmap: no black flashes, main thread
+3-7% busy) and a site that only redraws the TV screen while playing. GTA SA ~28-32 vbl/s in free roam, ~40-45
+in the intros; FFX intro 37 (site) with drops. EE block chaining/context promotion gave no gain (off).
 In progress (fork branches, see notes/): `vu-jit` (VU codegen: context promotion, differential test,
 VU1 replay benchmark), `ee-jit` (EE dispatcher/block linking/traces — the GTA bottleneck).
 Next: finish ee-jit and vu-jit, merge into web-perf with ABAB measurements, then Phase 3 traces.
