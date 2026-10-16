@@ -84,3 +84,53 @@ penalty measured here would eat if it carries over.
    data shows 16/128 still gives 73% internal transitions on GTA) or Binaryen preprocessing (M6) moves earlier.
 3. If it goes away: re-run this replay, then start M2b (EE region former, region epilog/exits, invalidation)
    with the structurer as is.
+
+## Per-part penalty: root cause (2026-10-16, follow-up)
+Play `tier2` abc641dc, CodeGen `tier2` 9d091b8. Variants: `public/emu-t2y` (memarg only), `public/emu-t2p`
+(memarg + plan cache = current), `emu-t2n`/`emu-t2z` (profiling helpers). Tools in scratchpad t2/: `sbx/` (dumps,
+`ana2.py` = TurboFan code of each superblock vs its parts, offline with emsdk node 24 `--print-wasm-code`),
+`prof.mjs` (CDP CPU profile of the replay in every page worker, JIT self vs called-from-JIT vs outside).
+
+**The superblock code is not slower.** CPU profile of the replay, every round promoted (`setVuExperiment(0x10000)`)
+or every round superblocks (`0x20000`), 300 iterations: JIT self time 114k samples (promoted) vs 107k
+(superblocks). The extra time was outside the JIT: `CVuExecutor::PartitionFunction` (24k samples, superblock mode
+only), more `shared_ptr` work and block bookkeeping. Cause: every microprogram switch (replay and game) runs
+`InvalidateMicroProgram`, which drops every VU block. The blocks come back from the content cache (0 compiles in the
+timed window, new counter), but each superblock head ran `PlanSuperBlock` again (16x FindBlockEnd, dominators,
+RPO), which cost more than the superblock saved.
+
+Fixes:
+1. Plans memoized per (head, key of the code in [head, head + MAX_BLOCK_SIZE)) (`m_superBlockPlans`, cleared on
+   Reset/DropBlocks). VU1 replay, us/program (min of 3 rounds, same run):
+   | build | promoted | superblocks |
+   |---|---|---|
+   | t2x (before) | 26.7 / 25.5 | 30.6 / 30.9 (+15-20%) |
+   | t2y (memarg) | 21.7 / 24.9 / 24.1 | 23.1 / 27.9 / 28.3 (+6-17%) |
+   | t2p (memarg + plans) | 26.8 / 20.3 / 27.5 | 27.0 / 19.3 / 27.7 (parity) |
+   The machine was noisy (reference varied 25-44 between runs), so only same-run ratios count.
+2. CodeGen: context fields addressed through the memarg offset (`load offset=N (ctx)`) instead of
+   `i32.add(ctx, N)`. TurboFan value-numbered the adds in big functions into long-lived values and spilled them
+   (`leal r14,[rax+0x410]`, reloads from `[rbp-..]`). On 20 superblocks: stack spill/reload instructions
+   8844 -> 4220 (parts alone: 5398), instructions 72.6k -> 66.3k (parts: 62.2k). Worth about half of the gap.
+   Applies to every JIT block (EE too). The persistent block cache key has no codegen version, so old cached
+   code (still correct) is reused until the cache is cleared.
+- Binaryen did not help: `wasm-opt --optimize-added-constants` (low-memory-unused, bound 1 MB) folded only
+  ~10% of the adds; -O2/-O3 gave larger TurboFan code (ratio 1.26/1.25 vs 1.17).
+- MAX_PARTS 2/4/8 and "no flag forwarding": within noise (run before the plan cache; superblocks equal to or a bit
+  slower than promoted in every setting). Direct jumps from the epilogue arms were not tried: the dispatch compare
+  is a few instructions per part and the JIT self time already shows no penalty.
+- Checks: replay mismatches 0; play.zip state hash c936a1d9d596 with superblocks off and on (= M0 digest); CodeGen
+  wasm suite passes (pattern + structured).
+
+## Decision (updated)
+Go for M2b. TurboFan handles structured multi-block functions with promoted locals well (equal or slightly better
+JIT time per part). The superblock slowdown was executor bookkeeping on VU-specific invalidation, which EE regions
+mostly avoid (EE code is rarely invalidated). Superblocks reach parity, not a gain, because VU1 programs are short
+and invalidated often.
+M2b plan, with what this taught:
+1. Region former with plans cached by code content (never re-plan on re-creation); make re-creation after
+   invalidation cheap (no per-entry graph work, no std::function/shared_ptr churn per part).
+2. Measure the JIT self time per region vs its blocks with `prof.mjs`-style profiles from the start (wall-clock
+   replay ratios were too noisy on this machine to see 5-10%).
+3. Keep the memarg addressing; consider a block-cache version bump so tier 1 picks it up.
+4. Caps: start at 16 parts; size them by profile, not by the spill counts (static spills did not predict runtime).
