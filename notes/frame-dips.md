@@ -97,3 +97,13 @@ What is behind each cause:
 6. Then, by measured share: cache-hit instantiation cost (0.15 ms/block; prefetch/batch cached successors),
    block-cache flush of the session tail (emulator.js flushes every 30 s / 1 MB: flush sooner after Jitter runs),
    GS thread spikes behind VU1 waits (shader/program creation?), disc read-ahead on a worker if GoW shows it.
+
+## Result (2026-10-16 13:00) - merged web-perf b3f4a74f -> 79452b5f (pushed to fork frame-dips)
+Kept web-perf's dual-layer fast path (d919fb3f), dropped the WIP copy. Variants: `emu-dipsbase2` (79452b5f with
+the 3 fixes reverted + CodeGen d8c5b47), `emu-dipsfix2` = `emu-dipsfinal` (79452b5f, CodeGen 70937f3).
+Hashes (hash=300, vu1thread=0) identical base/fix on play, car, ffx, gow-fight (one base play run was an
+outlier, the repeat matched). A/B warm cache, 90 s x3 alternated (dips/f{1,2,3}-*.json):
+play(walk) base p5 24/24/18, slow 40/55/142, >2x 22/22/30, >100ms 35/29/81, max 274/173/353;
+fix p5 25/25/24, slow 41/62/61, >2x 7/20/17, >100ms 25/34/37, max 165/351/214; VU1-wait share of spikes
+47-61% -> 11-17%. gow-fight: neutral (p5 34/34/27 vs 34/46/34, >100ms 1/0/0 vs 0/0/0).
+Still open: next steps 3, 5, 6 above (remaining big VU compile, GoW cold boot check, cache-hit cost).
