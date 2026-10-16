@@ -53,7 +53,18 @@ Next: finish ee-jit and vu-jit, merge into web-perf with ABAB measurements, then
   address is known to be in RAM).
 - Expected: the big multiplier, ~1.5-2x on EE/VU code.
 
-## Phase 4: per-game ahead-of-time recompilation (months, optional)
+## Phase 3b: in-browser tier-2 JIT (weeks to months) — see notes/tier2-jit-design.md
+- Tier 1 = today's JIT. A sampler thread finds hot code; a background worker recompiles hot single-entry
+  regions (same front end/IR, general CFG structuring, effect classes for helpers so promoted registers
+  survive slow paths), the VM thread installs them; persisted in the OPFS block cache. Works for every game
+  in any browser with nothing installed. Expected 1.2-1.8x on the VM thread. First milestone M0 (3-4 days):
+  edge counters + region simulation, effect classes for the memory slow path.
+
+## Phase 4 (rejected): per-game offline recompilation via C + clang
+Needs a native toolchain per player and produces code derived from the game; doesn't fit "open the link
+and play". Kept only as a reference in notes/tier2-jit-design.md.
+
+## Old Phase 4 text: per-game ahead-of-time recompilation (months, optional)
 - Record the blocks a game executes, translate them offline to C, compile with clang -O3 into a
   per-game wasm module loaded next to the emulator; the JIT stays as fallback for unseen code.
   This is the "recomp" approach, used only for flagship games that still miss full speed.
