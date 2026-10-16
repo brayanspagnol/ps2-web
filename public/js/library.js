@@ -1124,7 +1124,7 @@ const STYLE = `
 .ps2l-card:focus-visible .ps2l-case{outline:3px solid var(--accent);outline-offset:4px}
 .ps2l-tag:empty{display:none}
 .ps2l-tag{position:absolute;left:50%;bottom:-11px;translate:-50% 0;white-space:nowrap;padding:3px 8px;border-radius:999px;font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;
-  background:rgba(8,10,14,.82);border:1px solid var(--line);backdrop-filter:blur(4px)}
+  background:rgba(8,10,14,.86);border:1px solid var(--line)}
 .ps2l-card[data-owned] .ps2l-tag{color:var(--ok);border-color:rgba(95,224,161,.45)}
 .ps2l-card:not([data-owned]) .ps2l-tag{color:var(--muted)}
 .ps2l-nav{position:absolute;top:50%;transform:translateY(-50%);z-index:5;width:44px;height:44px;border-radius:50%;border:1px solid var(--line);
@@ -1172,7 +1172,8 @@ const STYLE = `
 .ps2l-dialog .ps2l-row{display:flex;gap:10px;justify-content:flex-end;flex-wrap:wrap}
 .ps2l-sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
 @keyframes ps2l-float{50%{translate:0 -6px}}
-.ps2l-card[data-sel] .ps2l-case{animation:ps2l-float 5s ease-in-out infinite}
+/* plays when a card gets selected, then rests: an endless loop kept the compositor busy on an idle shelf */
+.ps2l-card[data-sel] .ps2l-case{animation:ps2l-float 5s ease-in-out 2}
 @media (max-width:600px){
   .ps2l{--cw:clamp(118px,40vw,170px)}
   .ps2l-head{padding-top:16px;gap:8px}

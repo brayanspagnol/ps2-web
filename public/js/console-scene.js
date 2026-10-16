@@ -280,12 +280,20 @@ export function createConsoleScene(container, opts = {}) {
   // ---------- render loop (on demand) ----------
   const tweens = new Set();
   const frameCbs = new Set();
-  let raf = 0, last = 0, disposed = false, fullRender = true;
+  let raf = 0, poll = 0, idle = 0, last = 0, disposed = false, fullRender = true;
 
   // Objects on LIVE_LAYER (besides layer 0) change on their own (the TV screen). When no tween runs and
   // nothing called invalidate(), only they are redrawn over the last full frame, and only if an onFrame
   // callback did not return false: the full scene (shadows, physical materials, MSAA) costs GPU time
   // the emulator needs while playing.
+  // On the console view (the shelf) the TV is off: once nothing has changed for a moment, the callbacks
+  // are polled a few times a second instead of every display frame, so an idle page costs ~nothing.
+  // Starting a tween or calling invalidate() goes back to full rate at once.
+  function schedule(slow) {
+    if (raf || poll || disposed) return;
+    if (slow) poll = setTimeout(() => { poll = 0; frame(performance.now()); }, 200);
+    else raf = requestAnimationFrame(frame);
+  }
   function frame(now) {
     raf = 0;
     if (disposed) return;
@@ -312,12 +320,14 @@ export function createConsoleScene(container, opts = {}) {
       scene.background = bg;
       renderer.autoClear = true;
     }
-    if (tweens.size || frameCbs.size) raf = requestAnimationFrame(frame);
+    idle = full || live ? 0 : idle + dt;
+    if (tweens.size || frameCbs.size) schedule(view === "console" && idle > 0.5);
     else last = 0;
   }
   function invalidate() {
     fullRender = true;
-    if (!raf && !disposed) raf = requestAnimationFrame(frame);
+    clearTimeout(poll); poll = 0;
+    schedule(false);
   }
 
   function tween(ms, fn, easing = ease.inOut) {
@@ -519,7 +529,7 @@ export function createConsoleScene(container, opts = {}) {
     invalidate, // request one re-render after external changes (e.g. TV texture updated once)
     dispose() {
       disposed = true;
-      cancelAnimationFrame(raf);
+      cancelAnimationFrame(raf); clearTimeout(poll);
       ro.disconnect();
       tweens.clear(); frameCbs.clear();
       disposeObject(scene);
