@@ -10,7 +10,8 @@
   html, body { margin: 0; height: 100%; overflow: hidden; background: #07080b; color: var(--fg);
     font: 14px 'Inter', 'Segoe UI', Roboto, 'Noto Sans', Arial, sans-serif; }
   /* Emulator output: hidden but still rendering and focusable (it is copied onto the TV). */
-  #outputCanvas { position: fixed; left: 0; top: 0; opacity: .01; z-index: -1; pointer-events: none; }
+  /* Its pixel size follows the emulator output (upscaling); the layout size stays put. */
+  #outputCanvas { position: fixed; left: 0; top: 0; width: 640px; height: 480px; opacity: .01; z-index: -1; pointer-events: none; }
   #stage { position: fixed; inset: 0; }
   #library { position: fixed; inset: 0; z-index: 2;
     background: linear-gradient(to bottom, rgba(5,6,9,.55), rgba(5,6,9,.25) 40%, rgba(5,6,9,.8)); }
@@ -43,30 +44,44 @@
   <button type="button" id="b-load" title="Volta para o último ponto salvo (F8)">Carregar</button>
   <button type="button" id="b-fs">Tela cheia</button>
   <button type="button" id="b-crt" aria-pressed="true">Efeito CRT: ligado</button>
+  <button type="button" id="b-set" aria-haspopup="dialog">Configurações</button>
   <span id="fps"></span>
-  <p id="keys">Setas: D-pad · Z ✕ · X ◯ · A ▢ · S △ · Enter Start · Backspace Select · 1/2 L1/L2 · 8/9 R1/R2 · FTGH / IJKL analógicos</p>
+  <p id="keys"></p>
 </div>
 <script type="module">
   import * as emu from "./js/emulator.js";
   import { createConsoleScene } from "./js/console-scene.js";
   import { createCrtTv } from "./js/crt-tv.js";
   import { createLibraryUI, renderDiscLabel } from "./js/library.js";
+  import { createSettings, keyHint } from "./js/settings.js";
 
   const $ = (id) => document.getElementById(id);
   const msg = (text, err = false) => { $("msg").textContent = text; $("msg").className = err ? "err" : ""; };
 
   const view = createConsoleScene($("stage"));
-  const tv = createCrtTv({ sourceCanvas: $("outputCanvas"), frameId: emu.frameId });
+  let settings = null; // created right after the TV (it applies the CRT settings to it)
+  const tv = createCrtTv({ sourceCanvas: $("outputCanvas"), frameId: emu.frameId, onCrtChange: (on) => settings?.set("crt", on) });
   view.tvAnchor.add(tv.object3d);
   view.onFrame((dt) => tv.update(dt, view.renderer)); // runs every frame for the live TV (only the screen is redrawn)
 
+  function syncHud(s) {
+    $("b-crt").setAttribute("aria-pressed", String(s.crt));
+    $("b-crt").textContent = `Efeito CRT: ${s.crt ? "ligado" : "desligado"}`;
+    $("keys").textContent = keyHint(s);
+  }
+  settings = createSettings({
+    tv, getModule: emu.getModule, onChange: syncHud,
+    onClose: () => { if (!$("hud").hidden) $("outputCanvas").focus(); }, // keys go back to the game
+  });
+  syncHud(settings.settings);
+
   // Load the emulator in the background while the user browses the shelf.
   const emuReady = emu.init();
-  emuReady.catch((e) => msg("Não foi possível iniciar o emulador: " + e.message, true));
+  emuReady.then(() => settings.applyEmulator(), (e) => msg("Não foi possível iniciar o emulador: " + e.message, true));
 
   let fpsTimer = 0, busy = false;
 
-  const library = createLibraryUI($("library"), { onPlay: play });
+  const library = createLibraryUI($("library"), { onPlay: play, onSettings: () => settings.open() });
 
   async function play(game, file) {
     if (busy) return;
@@ -136,16 +151,12 @@
   $("b-save").addEventListener("click", () => quickState(true));
   $("b-load").addEventListener("click", () => quickState(false));
   addEventListener("keydown", (e) => {
-    if ($("hud").hidden || e.repeat) return;
+    if ($("hud").hidden || e.repeat || settings.isOpen()) return;
     if (e.key === "F5") { e.preventDefault(); quickState(true); }
     else if (e.key === "F8") { e.preventDefault(); quickState(false); }
   }, true);
-  $("b-crt").addEventListener("click", (e) => {
-    const on = e.currentTarget.getAttribute("aria-pressed") !== "true";
-    tv.setCrtEffect(on);
-    e.currentTarget.setAttribute("aria-pressed", String(on));
-    e.currentTarget.textContent = `Efeito CRT: ${on ? "ligado" : "desligado"}`;
-  });
+  $("b-crt").addEventListener("click", () => settings.set("crt", !settings.settings.crt));
+  $("b-set").addEventListener("click", () => settings.open());
 
   // Fade the HUD out while playing; any mouse movement brings it back.
   let idleTimer = 0;
