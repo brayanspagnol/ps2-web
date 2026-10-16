@@ -3,6 +3,8 @@
 // listens for keyboard events on it, so that canvas must exist before init().
 // ?emu=<name> picks the build in public/emu-<name>/ (A/B tests); default public/emu/.
 const EMU_VARIANT = new URLSearchParams(location.search).get("emu");
+// ?gs=webgpu picks the WebGPU GS renderer (builds that have it); WebGL2 when absent or without a GPU adapter.
+const GS_BACKEND = new URLSearchParams(location.search).get("gs");
 const EMU_DIR = new URL(/^[a-z0-9-]+$/.test(EMU_VARIANT ?? "") ? `../emu-${EMU_VARIANT}/` : "../emu/", import.meta.url).href;
 
 // Play! asks JS for disc sectors through this object and polls isDone().
@@ -62,6 +64,7 @@ export async function init() {
     out.transferFromImageBitmap(bitmap);
     if (gsFrames++ === 0) firstFrame();
   };
+  if (GS_BACKEND === "webgpu" && (await navigator.gpu?.requestAdapter().catch(() => null))) mod.gsBackend = "webgpu";
   mod.ccall("initVm", "", [], []);
   const out = canvas.getContext("bitmaprenderer");
   if (out) await gsReady; // the GS thread sets up its context once initVm returned; boot after that
