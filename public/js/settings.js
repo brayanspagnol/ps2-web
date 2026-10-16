@@ -45,7 +45,7 @@ const PAD_HOME = 16; // opens this panel; never bound to the game
 const RESERVED_KEY = /^(Escape|Tab|F\d+)$/; // panel / site shortcuts (F5 save, F8 load, F11 fullscreen)
 
 export const DEFAULTS = {
-  resFactor: 1, bilinear: false, widescreen: false, fill: false,
+  resFactor: 2, bilinear: false, widescreen: false, fill: false,
   crt: true, scanlines: 1, curvature: 1, bloom: 1,
   volume: 1, muted: false,
   frameLimit: true,

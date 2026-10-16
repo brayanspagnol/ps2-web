@@ -7,16 +7,17 @@ Site worktree `~/Projetos/ps2-web-ui` (branch `ui-settings`), emulator worktree 
 what to publish. `public/emu-uiprof/` (ignored by git) is the `-DPROFILE=ON` build of the same commit
 (`?emu=uiprof`, has `gsBusyMs` in `getProfile()`), built in `play-ui/build_cmake/build/wasm-prof`.
 
-## Status (2026-10-16 ~11:00, WIP)
+## Status (2026-10-16 ~11:55)
 - Done: panel, emulator API, persistence, live apply; rebased on origin/main 800364b (pause on leave);
-  play-ui merged web-perf 956de846 (swap fix + pauseVm) and rebuilt.
-- Pending: (1) proper upscaling measurement (see "Upscaling cost"); pick the default factor from it
-  (DEFAULTS.resFactor in settings.js, 1 for now). (2) One unexplained failure: in two scripted runs a CDP
-  click on "Tela cheia" after changing settings did nothing (no overlay); isolated repros (GTA, with and
-  without F8) all worked. Re-run run_func3-style: change resolution via the panel, then click Tela cheia,
-  with click/pointer instrumentation. (3) GoW renders with large green artifacts in the fight state
-  (gow-fight.zip) — check whether 1x shows them too (screenshots ui-f3-gow-1x/2x/3x.png in the scratchpad)
-  before blaming upscaling. (4) Real gamepad check if one is available.
+  play-ui merged web-perf b3f4a74f (GoW green hack + dual-layer fast path) and rebuilt; `public/emu` is
+  play-ui `ui-settings` b1674371 (release, `-msimd128`). Default internal resolution is now 2x (measured below).
+- "Tela cheia" click doing nothing: not reproduced. Scripted repro (GTA, panel -> change resolution -> Esc ->
+  click Tela cheia, 6 times with 1x-4x, pointer/click logging): every time the dialog was closed after Esc,
+  the click reached `#b-fs` and the page went fullscreen with the overlay. The two old failures stay
+  unexplained (most likely the CDP click landed while the modal was still open, so it hit the backdrop,
+  which closes the panel). Watch for it in manual use.
+- Open: GoW green artifacts in the fight state should be gone with the web-perf hack, not re-checked on
+  the site. Real gamepad check if one is available.
 
 ## What the user gets
 - "Configurações" in the HUD and in the shelf header (and the gamepad PS/Home button) opens a modal
@@ -55,21 +56,20 @@ what to publish. `public/emu-uiprof/` (ignored by git) is the `-DPROFILE=ON` bui
   `"Digit1"`), so those buttons never worked from the keyboard.
 The page feature-detects each function, so older builds keep working (their options are disabled).
 
-## Upscaling cost (PRELIMINARY, not trustworthy yet)
-First runs on the site (1280x720 viewport, release build, state reloaded before each factor, 2 s skip,
-12 s window, sequential order so the block cache warmed during the run; machine shared):
+## Upscaling cost
+Site on :8081, Brave CDP 1280x720, release build b1674371, `bench-run`. Per run: boot, F8 state, 40 s warm-up,
+then per factor: set it in the panel, F8, skip 40 s, measure 30 s (vblanks / wall time from `getProfile()`).
+Factor order 1,3,2 | 4,2,1 | 4,3 (two samples per factor, shuffled ABAB), machine shared (load ~5).
 | scene | 1x | 2x | 3x | 4x |
 |---|---|---|---|---|
-| FFX 3D intro (mtvu-ffx.zip), vbl/s | 42.0, 40.0 | 36.8, 38.4 | 36.1, 32.9 | 32.2 |
-| GTA play.zip, vbl/s (2nd pass, warm) | 27.2 | 27.0 | 29.4 | - |
-GPU awake (1 - RC6 residency, Intel UHD Raptor Lake-P; idle baseline ~29 %): FFX 28/40/53/49 %, GTA 37/47/66 %;
-GPU clock stayed far below max (110-380 of 1400 MHz). The GPU is not the bottleneck; the visible drop on FFX
-may be ordering/scene noise. TODO (coordinator's protocol): warm the block cache first, then shuffled ABAB
-order 1,3,2,4,2,1,4,3 on play.zip, mtvu-ffx.zip and gow-fight.zip (all copied into the :8081 OPFS, also as
-savestates/<game>.zip for F8), load state, skip >= 40 s, 30 s window, `bench-run` wrapper, max ~3 factors
-per run (< 5 min). Report median vbl/s per factor, GPU-process CPU (/proc/<brave gpu-process pid>/stat
-utime+stime delta) and GS thread busy (`gsBusyMs` from `?emu=uiprof`). Script to adapt:
-scratchpad/ui/run_site.py (env GAME, FACTORS, SECS, TAG, SKIP; uses the panel to switch factors).
+| GTA play.zip, vbl/s (samples) | 31.8, 27.7 | 31.5, 31.9 | 27.7, 35.5 | 26.4, 26.0 |
+| GTA median | 29.8 | 31.7 | 31.6 | 26.2 |
+| FFX mtvu-ffx.zip, vbl/s (samples) | 56.0, 58.9 | 53.7, 56.3 | 53.2, 54.7 | 48.4, 50.0 |
+| FFX median | 57.5 | 55.0 | 54.0 | 49.2 |
+| GPU awake (1 - RC6), typical | ~31 % | 44-67 % | 55-59 % | 52-96 % |
+2x costs nothing measurable on GTA and ~4 % on FFX (inside the run-to-run noise of ~4 vbl/s); 4x costs
+10-15 %. Default = 2x. GPU clock stays far below max (<= 480 of 1400 MHz) at every factor.
+Script: scratchpad ui/run_site.py (env GAME, FACTORS, SECS, SKIP, WARM) driven by ui/upscale.sh.
 
 ## Checks done (Brave CDP instance, 1280x720 viewport)
 - Panel from the shelf at desktop and phone width (390 px: full-screen sheet, no horizontal scroll);
