@@ -16,7 +16,13 @@ class DiscImageDevice {
     this.file.slice(offset, offset + size).arrayBuffer().then((buf) => {
       this.module.HEAPU8.set(new Uint8Array(buf), dstPtr);
       this.done = true;
-    }, (e) => console.error(`Falha ao ler o disco (${offset}+${size}):`, e)); // RemoteFile already retried
+    }, (e) => {
+      // RemoteFile already retried: give the VM zeros (it polls isDone forever otherwise) and tell the page
+      console.error(`Falha ao ler o disco (${offset}+${size}):`, e);
+      this.module.HEAPU8.fill(0, dstPtr, dstPtr + size);
+      this.done = true;
+      dispatchEvent(new CustomEvent("ps2-disc-error", { detail: e }));
+    });
   }
 }
 

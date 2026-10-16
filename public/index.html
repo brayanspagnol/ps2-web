@@ -132,6 +132,8 @@
   $("b-lib").addEventListener("click", () => { if (!busy) { busy = true; backToLibrary().finally(() => (busy = false)); } });
   $("b-fs").addEventListener("click", () => tv.enterFullscreen());
 
+  addEventListener("ps2-disc-error", (e) => msg(`Erro ao ler o disco: ${e.detail?.message ?? e.detail}`, true));
+
   async function quickState(save) {
     if (busy) return;
     busy = true;

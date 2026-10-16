@@ -7,6 +7,7 @@ from ./games streamed at /games/<name> with HTTP Range support and listed at
 Usage: python3 serve.py [port] [--host HOST]"""
 import argparse
 import http.server
+import ipaddress
 import json
 import os
 import re
@@ -43,7 +44,25 @@ def game_path(name):
     return p
 
 
+def host_allowed(host, bind_host):
+    """DNS rebinding guard: the Host header must be localhost, an IP literal or the --host name
+    (a rebinding page always sends its own domain name)."""
+    m = re.fullmatch(r"\[([0-9a-fA-F:.]+)\](?::\d+)?|([^:\[\]]+)(?::\d+)?", (host or "").strip())
+    if not m:
+        return False
+    name = (m[1] or m[2]).lower().rstrip(".")
+    if name in ("localhost", bind_host.lower().strip("[]")):
+        return True
+    try:
+        ipaddress.ip_address(name)
+        return True
+    except ValueError:
+        return False
+
+
 class Handler(http.server.SimpleHTTPRequestHandler):
+    bind_host = "127.0.0.1"
+
     extensions_map = {**http.server.SimpleHTTPRequestHandler.extensions_map,
                       ".wasm": "application/wasm", ".js": "text/javascript"}
 
@@ -54,12 +73,18 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         super().end_headers()
 
     def do_GET(self):
-        if self.games_route(head=False) is None:
+        if self.host_check() and self.games_route(head=False) is None:
             super().do_GET()
 
     def do_HEAD(self):
-        if self.games_route(head=True) is None:
+        if self.host_check() and self.games_route(head=True) is None:
             super().do_HEAD()
+
+    def host_check(self):
+        if host_allowed(self.headers.get("Host"), self.bind_host):
+            return True
+        self.send_error(403, "Host not allowed")
+        return False
 
     # Returns None when the request is not under /games/ (static files handle it).
     def games_route(self, head):
@@ -134,6 +159,10 @@ def selftest():
     assert parse_range("bytes=-0", 1000) is None
     assert parse_range("bytes=0-1,5-6", 1000) is None
     assert parse_range("items=0-1", 1000) is None
+    for h in ("localhost:8080", "127.0.0.1:8080", "[::1]:8080", "localhost", "192.168.0.5:8080", "pc.lan:80"):
+        assert host_allowed(h, "pc.lan"), h
+    for h in ("evil.example:8080", "evil.example", "", None, "localhost.evil.example", "[::1"):
+        assert not host_allowed(h, "127.0.0.1"), h
     assert game_path("../serve.py") is None and game_path(".hidden") is None and game_path("a/b") is None
 
 
@@ -151,6 +180,7 @@ if __name__ == "__main__":
         print(f"AVISO: servindo em {args.host} — qualquer aparelho dessa rede pode acessar o site e os jogos em games/. "
               "Use só na sua rede doméstica, nunca em rede pública. "
               "(SharedArrayBuffer exige contexto seguro: em outro aparelho, só funciona via HTTPS ou localhost.)")
+    Handler.bind_host = args.host
     GAMES_DIR.mkdir(exist_ok=True)
     print(f"http://localhost:{args.port}/  (jogos em {GAMES_DIR})")
     http.server.ThreadingHTTPServer((args.host, args.port), partial(Handler, directory=BASE / "public")).serve_forever()
