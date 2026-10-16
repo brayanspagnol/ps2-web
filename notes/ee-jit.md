@@ -123,3 +123,56 @@ not measured alone.) In-game play.zip, MTVU on, limiter on, median vbl/s t=40-72
   at the EE changes; needs checking by whoever owns site-gs.
 - Next levers: Execute self time (~29%): bigger compilation units (EE superblocks over PartitionFunction regions
   without promotion), leaner branch epilogue (select instead of nDelayedJumpAddr store + reload).
+
+## Session 3 (2026-10-16): where the "dispatcher" time really goes, EE regions
+Branch `ee-jit` on top of f08f5db1 (Play) / d8c5b47 (CodeGen); new work in new commits only.
+
+### Tooling (scratchpad `tools/`, session-specific; the old cdprun/cbench were lost with /tmp)
+- `run.mjs '<bench query>' [--pmc] [--wait=s] [--eval=expr] [--shot=png]`: own tab on [::1]:9222, waits for
+  &time/&hash results, VM thread = hottest thread of the test Brave, pins the renderer to P-cores (0-7) and
+  reports wall ms/vbl, VM-thread CPU ms/vbl, executor dispatches/vbl (`Module.eeDispatchCount`) and, with
+  --pmc, hardware counters of the VM thread over the window (`pmc.c`: perf_event_open, user space, cpu_core
+  PMU: cycles, instructions, branch misses, L1i/iTLB misses, ICACHE_DATA/TAG stall cycles, L2 code reads).
+  `ab.sh <rounds> <state> <variant query>...` alternates variants. Game runs go through `locks/bench-run`.
+- Precise attribution without the V8 profiler: a scratch headless Brave (127.0.0.1:9333, own profile with the
+  states copied over, `--js-flags=--perf-basic-prof`) + `psample.c` (perf_event_open IP sampling of the VM
+  thread) + `/tmp/perf-<pid>.map` -> per-function and per-instruction histograms; `memhelper.py` launches
+  that Brave as its child so it can read JIT code from /proc/<pid>/mem (ptrace scope 1) for objdump.
+- The machine clock wanders (P-cores 1.2-2.0 GHz under load, other agents running): compare cycles/vbl and
+  instructions/vbl from the counters, not only wall ms.
+
+### Findings (play.zip, VU1 on the VM thread, vblanks 150-400, IP samples)
+- The ~29% "CEeExecutor::Execute self time" of the V8 CPU profiles was a sampling artifact. With IP samples:
+  the executor loop is 7-9% of the VM thread. Inside it (disassembled TurboFan code) the time sits on a chain
+  of dependent loads per call: block table (2 loads, ~30%), V8's call_indirect dispatch table (bounds +
+  signature, ~20%), V8's code pointer table entry (~30%), the indirect call and the reload after it.
+- 8.7% of the VM thread ran EE blocks in Liftoff (+3.5% WasmLiftoffFrameSetup): 7900 batch functions hit
+  were Liftoff vs 1200 TurboFan. V8 15.1's tier-up budget is 13M "bytes executed" per function and Liftoff
+  spends it by machine code offset at the return, so a ~2 KB block needs ~6000 calls before TurboFan, and
+  batching restarts it. Scratch Brave with `--wasm-tiering-budget=1000000`: -6% cycles/vbl. (`--no-liftoff`
+  was slower: synchronous TurboFan compiles on the VM thread.)
+- Generated code per EE block is large (TurboFan ~2.5-3.8 KB, Liftoff ~2-3 KB machine code for ~7 MIPS
+  instructions); L1i misses ~3.6M/vbl, ICACHE_DATA stalls ~10% and ICACHE_TAG stalls ~6% of cycles.
+- Branch misses ~0.2M/vbl (~5% of cycles at ~20 cycles each).
+- ~246k executor dispatches per vblank (= EE blocks executed, 7.2 instructions each).
+
+### EE regions (on by default: Module.setEeRegionSpan(16384), bench `&eeregion=N`, 0 = off)
+- At batch flush (now 128 blocks, `&eebatch`), the pending blocks are sorted by address and runs of live
+  blocks within 16 KB (max 64 blocks) become one wasm function. CodeGen `BuildBatchModule(modules,
+  functions, exports, REGION_PARAMS)` stitches the existing per-block bodies (decoder for the Jitter's
+  instruction subset; locals renumbered per type, so no recompilation): `loop { block x N { br_table on
+  ((pc & mask) - start) >> 2 } <block i body> ; if (exception | generation changed) return; next block in
+  address order falls through, anything else re-dispatches via the br_table }`. Same semantics as the
+  executor loop; blocks that use chaining can't be members (the batch falls back to plain functions).
+- Every member keeps its own table slot (no addFunction dedup) to the region function. `CMIPS::m_blockGeneration`
+  is bumped by CEeExecutor::ClearActiveBlocksInRange, which also dissolves overlapping regions (members get a
+  new instance of their own module); a region function already on the stack leaves at its next block exit.
+- Executor dispatches 246k -> ~97k per vblank (61% of block transitions stay inside a function); batch Liftoff
+  time 8.7% -> 1.3% (big functions tier up fast); executor loop 8.8% -> 5.9% of the VM thread.
+- Offline check: `rtest.cpp` (scratchpad) runs the region builder over all 25.6k EE modules of a block cache
+  dump; every body rewrites and all generated modules validate in Node.
+
+### Tried and left off
+- `Module.setJitBranchSelect(true)` / bench `&brsel=1`: MIPS branches and the delayed-jump epilogue with
+  wasm `select` instead of if/else (hash-identical). More instructions, no cycle gain on play.zip. Off.
+  (Needed: OP_SELECT now accepts a constant condition, e.g. `beq zero, zero`.)

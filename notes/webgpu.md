@@ -94,4 +94,43 @@ into a render pass on the GS thread's OffscreenCanvas `webgpu` context, then the
 - M4: performance vs WebGL2 (alternated runs), GPU time (timestamp queries), optimizations (tile-local
   frame buffer cache in workgroup memory, specialized pipelines, fewer dispatches).
 
+## Code map (Play! fork, branch `webgpu`)
+- `Source/gs/GSHandler.{h,cpp}`: `SuspendThreadProc()` (GS thread returns to the worker event loop until JS
+  calls `ResumeThreadProc(this)`).
+- `Source/ui_js/GSH_WebGPU.{h,cpp}`: CGSH_WebGPU (GS thread). Register/primitive handling ported from
+  GSH_Vulkan.cpp; records a command list (`OP_*`), an upload arena, primitives (`PRIM_WORDS` = 28 words) and
+  state records (`STATE_WORDS` = 40, layout in `STATE_*`). Batches = runs of primitives with the same
+  frame/depth buffer; binned per 8x8 tile in `FlushBatch`. Host transfers are queued (`m_pendingXfers`) and
+  dispatched together; CLUTs use a 1024-slot ring; CLUTs that come from a recent small host transfer are built
+  on the CPU (`LoadClutFromTransfer`).
+- `Source/ui_js/GSH_WebGPU.js` (`--pre-js`): `GsWgpu` (device, buffers, pipelines, `execute()`), all WGSL.
+  `drawConfig` = shader tuning knobs; `drawFeatures` = override constants of the specialized draw pipelines.
+- `Source/ui_js/Main.cpp`: `Module.gsBackend = "webgpu"` before `initVm` picks the backend;
+  `Module.setGsDebug(1)` logs stats from the GS worker every 2 s, `setGsDebug(2|1)` captures a frame
+  (`Module.onGsCapture(object)` on the page).
+- Site: `public/js/emulator.js` `?gs=webgpu`.
+
+## Tools (scratchpad `wgpu/`, session-specific; recreate from here if lost)
+- `wrun.mjs '<bench query>' <secs> [--shot=prefix --shotAt=a,b] [--pre=expr] [--captureAt=s --captureDir=dir]`:
+  own tab on the test Brave, worker console capture, vbl/s samples, abort rules; `--captureAt` saves a frame
+  capture (memory/copy/CLUT/swizzle buffers + command lists) into `public/emu-webgpu-replay/<name>/`.
+- `public/emu-webgpu-replay/replay.html?cap=<name>&iter=N[&tile=8&primCache=0&pixelCache=1&exit=k&profile=1]`
+  (gitignored dir): replays the capture with the current `GSH_WebGPU.js` copied next to it; prints wall
+  ms per frame, a hash of GS memory after the frame (must not change with optimizations), per-dispatch GPU
+  times with `profile=1`, `exit=k` stops shading at stage k (profiling). `replay.sh <name> [iter] [shot] [query]`.
+- `cmp.sh <emu> <play|car|ffx|gow-fight> <secs> <tag> [shotAt]`: WebGPU run then WebGL2 run of the same state.
+- Note: every new Play.wasm invalidates the JIT block cache, so the first in-game run of a build compiles a
+  lot (jit=600+); compare builds on a second run. The GPU is shared (other agents' tabs): use the replay
+  minimum and repeat.
+
 ## Log
+- 2026-10-16 M1: transfers/present working (emu-webgpu1), black frames. M2: draws (emu-webgpu2): GTA play.zip
+  looks like WebGL2 (slightly warmer colors), GoW gow-fight has correct colors without the green hack and
+  draws its shadows. Performance first pass: GoW 14-20 vbl/s, GTA 17-26 (WebGL2 30-50).
+- Perf findings (replay, Intel UHD): the GPU is latency-bound, not ALU-bound. Testing every primitive of a
+  batch against every tile was O(tiles x prims) (CPU binning fixed it); CLUT loads split GoW's main pass into
+  ~60 dispatches (CLUT ring fixed it); per-lane coverage tests were the biggest cost: each primitive's 8x8
+  coverage mask is now computed once per tile by one invocation (incremental edge functions), lanes skip
+  uncovered primitives (GoW frame 91 -> 52 ms). Workgroup-memory copies of primitives were slower (dropped).
+  GTA streams ~500 small texture/CLUT uploads per frame: transfers are now merged into one dispatch and
+  hoisted over the open batch when it doesn't touch their memory; CLUTs from those uploads are built on the CPU.
