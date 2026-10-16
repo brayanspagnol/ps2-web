@@ -60,6 +60,14 @@ Next: finish ee-jit and vu-jit, merge into web-perf with ABAB measurements, then
   in any browser with nothing installed. Expected 1.2-1.8x on the VM thread. First milestone M0 (3-4 days):
   edge counters + region simulation, effect classes for the memory slow path.
 
+## Graphics accuracy
+- Short term: in the WebGL2 renderer, emulate format aliasing of framebuffers (e.g. CT16 views of a CT32
+  target, the "channel shuffle" God of War and the Sly series use for shadows) with reinterpreting shaders,
+  like PCSX2's hardware renderer.
+- Long term: a WebGPU GS renderer ported from Play!'s Vulkan backend (it works on GS memory directly with
+  compute/storage buffers, so aliasing is exact for every game). Weeks to months; depends on WebGPU
+  availability on each platform.
+
 ## Phase 4 (rejected): per-game offline recompilation via C + clang
 Needs a native toolchain per player and produces code derived from the game; doesn't fit "open the link
 and play". Kept only as a reference in notes/tier2-jit-design.md.
