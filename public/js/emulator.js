@@ -85,6 +85,11 @@ export async function boot(file, { blockCache = true } = {}) {
   document.getElementById("outputCanvas").focus();
 }
 
+// Stops emulation until the next boot() (emulation threads idle, audio suspended). Older builds keep running.
+export function pause() {
+  mod?.pauseVm?.();
+}
+
 // The Play! module (debugging / measurements from the console), or null before init().
 export const getModule = () => mod;
 

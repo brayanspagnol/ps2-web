@@ -91,9 +91,9 @@
     }
   }
 
-  // Play! has no "stop" call; the VM keeps running until the next boot resets it.
-  // So going back only blanks the TV and ejects; booting another game replaces it.
+  // Going back pauses the emulator (CPU and audio idle); booting another game resets it.
   async function backToLibrary() {
+    emu.pause();
     $("hud").hidden = true;
     clearInterval(fpsTimer);
     if (tv.isFullscreen()) await tv.exitFullscreen();
