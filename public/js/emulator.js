@@ -44,14 +44,20 @@ export async function init() {
   // The GS thread renders on its own OffscreenCanvas and sends every frame here as an ImageBitmap.
   // Builds before that create a WebGL context on #outputCanvas in initVm (so "bitmaprenderer" is null)
   // and draw into it themselves.
+  // The frame size follows the GS output (it grows with the internal resolution, see setGsOptions).
   let firstFrame;
   const gsReady = new Promise((r) => (firstFrame = r));
+  const canvas = document.getElementById("outputCanvas");
   mod.onGsFrame = (bitmap) => {
+    if (canvas.width !== bitmap.width || canvas.height !== bitmap.height) {
+      canvas.width = bitmap.width;
+      canvas.height = bitmap.height;
+    }
     out.transferFromImageBitmap(bitmap);
     if (gsFrames++ === 0) firstFrame();
   };
   mod.ccall("initVm", "", [], []);
-  const out = document.getElementById("outputCanvas").getContext("bitmaprenderer");
+  const out = canvas.getContext("bitmaprenderer");
   if (out) await gsReady; // the GS thread sets up its context once initVm returned; boot after that
   return mod;
 }

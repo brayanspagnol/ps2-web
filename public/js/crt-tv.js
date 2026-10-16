@@ -28,6 +28,8 @@ uniform vec2 srcSize;
 uniform vec2 viewRes;
 uniform float time;
 uniform float crt;
+uniform vec3 crtParams;  // x: scanlines + mask, y: curvature, z: bloom (each 0..2, 1 = default look; scaled by crt)
+uniform float aspect;    // source picture aspect (4:3, or 16:9 with the emulator's widescreen option)
 uniform float signal;
 uniform vec3 power;      // x: horizontal open, y: vertical open, z: brightness
 varying vec2 vUv;
@@ -36,12 +38,12 @@ float hash(vec2 p) { p = fract(p * vec2(123.34, 456.21)); p += dot(p, p + 45.32)
 
 vec2 barrel(vec2 uv) {
   vec2 c = uv * 2.0 - 1.0;
-  c += c * (c.yx * c.yx) * vec2(0.045, 0.06) * crt;
+  c += c * (c.yx * c.yx) * vec2(0.045, 0.06) * crt * crtParams.y;
   return c * 0.5 + 0.5;
 }
 
 vec3 src(vec2 uv) {
-  vec2 d = (uv - 0.5) * 0.0045 * crt;          // radial chromatic aberration
+  vec2 d = (uv - 0.5) * 0.0045 * crt * crtParams.y; // radial chromatic aberration
   return vec3(texture2D(tSrc, uv + d).r, texture2D(tSrc, uv).g, texture2D(tSrc, uv - d).b);
 }
 
@@ -58,10 +60,12 @@ void main() {
   vec2 uv = vUv;
 #ifdef FULLSCREEN
   vec2 fc = gl_FragCoord.xy / viewRes;
-  float va = viewRes.x / viewRes.y, a = 4.0 / 3.0;
+  float va = viewRes.x / viewRes.y, a = aspect;
   vec2 box = va > a ? vec2(a / va, 1.0) : vec2(1.0, va / a);   // letterbox / pillarbox
   uv = (fc - 0.5) / box + 0.5;
   if (uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0) { gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0); return; }
+#else
+  uv.y = (uv.y - 0.5) * max(aspect * 0.75, 1.0) + 0.5;   // wider picture: letterboxed on the 4:3 tube
 #endif
   vec2 q = barrel(uv);
   vec2 open = max(power.xy, vec2(0.004, 0.006));
@@ -71,22 +75,23 @@ void main() {
   if (p.x >= 0.0 && p.y >= 0.0 && p.x <= 1.0 && p.y <= 1.0) {
     if (signal > 0.5) {
       col = src(p);
-      col += glow(p) * 0.15 * crt;
+      col += glow(p) * 0.15 * crt * crtParams.z;
     } else {
       float n = hash(floor(p * vec2(320.0, 240.0)) + fract(time * 7.13) * 91.0);
       col = vec3(n * 0.75 + 0.1) * (0.9 + 0.1 * sin(p.y * 40.0 + time * 30.0));
     }
     if (crt > 0.0) {
+      float sl = crt * crtParams.x;
       // scanlines (240 beam lines), faded out where they would alias
       float lines = srcSize.y * 0.5;
       float s = 0.5 + 0.5 * cos(p.y * lines * 6.2831853);
       float aa = clamp(1.6 - fwidth(p.y * lines) * 1.6, 0.0, 1.0);
-      col *= 1.0 - crt * 0.38 * aa * (1.0 - s) * (1.0 - 0.5 * dot(col, vec3(0.33)));
+      col *= 1.0 - min(sl * 0.38, 0.9) * aa * (1.0 - s) * (1.0 - 0.5 * dot(col, vec3(0.33)));
       // aperture grille on the physical pixels
       float m = mod(floor(gl_FragCoord.x), 3.0);
       vec3 mask = m < 1.0 ? vec3(1.0, 0.78, 0.78) : (m < 2.0 ? vec3(0.78, 1.0, 0.78) : vec3(0.78, 0.78, 1.0));
-      col *= mix(vec3(1.0), mask * 1.12, crt * 0.6);
-      col *= 1.1;                                 // compensate scanline/mask darkening
+      col *= mix(vec3(1.0), mask * 1.12, min(sl * 0.6, 1.0));
+      col *= 1.0 + 0.1 * min(sl, 1.5);            // compensate scanline/mask darkening
       // vignette, rolling bar, flicker, noise
       vec2 v = q * (1.0 - q);
       col *= mix(1.0, pow(clamp(v.x * v.y * 16.0, 0.0, 1.0), 0.22), crt);
@@ -239,19 +244,24 @@ function sampleKeys(keys, t) {
 
 // frameId (optional): returns an id that changes when the source has a new frame (null = unknown);
 // the texture is only re-uploaded then. Without it the source is uploaded every frame.
-export function createCrtTv({ sourceCanvas, frameId, width = 0.7, style = "grey" } = {}) {
+// The source canvas may change size (emulator upscaling); the shader's scanlines stay at 240 lines.
+// onCrtChange(on) (optional): called when the CRT effect is switched (also by the fullscreen button).
+export function createCrtTv({ sourceCanvas, frameId, onCrtChange, width = 0.7, style = "grey" } = {}) {
   if (!sourceCanvas) throw new Error("createCrtTv: sourceCanvas é obrigatório.");
 
   const tex = new THREE.Texture(sourceCanvas);
   tex.minFilter = THREE.LinearFilter;
   tex.generateMipmaps = false;
+  let texW = sourceCanvas.width, texH = sourceCanvas.height;
 
   const uniforms = {
     tSrc: { value: tex },
-    srcSize: { value: new THREE.Vector2(sourceCanvas.width, sourceCanvas.height) },
+    srcSize: { value: new THREE.Vector2(640, 480) }, // native PS2 frame (scanline count, glow radius)
     viewRes: { value: new THREE.Vector2(1, 1) },
     time: { value: 0 },
     crt: { value: 1 },
+    crtParams: { value: new THREE.Vector3(1, 1, 1) },
+    aspect: { value: sourceCanvas.width / sourceCanvas.height },
     signal: { value: 0 },
     power: { value: new THREE.Vector3(0, 0, 0) },
   };
@@ -274,6 +284,7 @@ export function createCrtTv({ sourceCanvas, frameId, width = 0.7, style = "grey"
     if (e.key === "Escape" && fs.active) { if (e.type === "keydown") exitFullscreen(); return; }
     if (e.target === sourceCanvas) return;
     const t = e.target;
+    if (t?.closest?.("dialog[open]")) return; // settings and other modal panels keep their keys
     if (t && (t.isContentEditable || t.tagName === "TEXTAREA" || t.tagName === "SELECT" ||
         (t.tagName === "INPUT" && !["file", "button", "checkbox", "range", "submit"].includes(t.type)))) return;
     const ev = new KeyboardEvent(e.type, {
@@ -289,7 +300,7 @@ export function createCrtTv({ sourceCanvas, frameId, width = 0.7, style = "grey"
   document.addEventListener("keydown", onKey, true);
   document.addEventListener("keyup", onKey, true);
 
-  let powered = false, signal = false, lastFrameId = null;
+  let powered = false, signal = false, lastFrameId = null, dirty = false;
   let anim = null; // { keys, t, resolve }
 
   function setPower(on) {
@@ -309,10 +320,24 @@ export function createCrtTv({ sourceCanvas, frameId, width = 0.7, style = "grey"
   let crtOn = true;
 
   function setCrtEffect(on) {
+    const changed = crtOn !== !!on;
     crtOn = !!on;
     uniforms.crt.value = crtOn ? 1 : 0;
-    if (fs.crtBtn) fs.crtBtn.textContent = crtOn ? "CRT: ligado" : "CRT: desligado";
+    dirty = true;
+    if (fs.crtBtn) {
+      fs.crtBtn.textContent = crtOn ? "CRT: ligado" : "CRT: desligado";
+      fs.crtBtn.setAttribute("aria-pressed", String(crtOn));
+    }
+    if (changed) onCrtChange?.(crtOn);
   }
+
+  // Strength of each part of the effect, 0 (off) .. 2; 1 is the default look.
+  function setCrtParams({ scanlines = 1, curvature = 1, bloom = 1 } = {}) {
+    const k = (v) => Math.max(0, Math.min(2, Number(v) || 0));
+    uniforms.crtParams.value.set(k(scanlines), k(curvature), k(bloom));
+    dirty = true;
+  }
+
 
   function buildFullscreen() {
     const el = document.createElement("div");
@@ -377,7 +402,8 @@ export function createCrtTv({ sourceCanvas, frameId, width = 0.7, style = "grey"
   // so the caller can skip redrawing it.
   function update(dt /* , renderer */) {
     uniforms.time.value += dt;
-    let changed = !!anim || (powered && !signal); // power animation / static noise move every frame
+    let changed = dirty || !!anim || (powered && !signal); // power animation / static noise move every frame
+    dirty = false;
     let p;
     if (anim) {
       anim.t += dt;
@@ -391,7 +417,15 @@ export function createCrtTv({ sourceCanvas, frameId, width = 0.7, style = "grey"
     // Upload the emulator's latest frame only when it can be seen and is new.
     if (signal && (powered || anim)) {
       const id = frameId?.() ?? null;
-      if (id === null || id !== lastFrameId) { tex.needsUpdate = true; changed = true; }
+      if (id === null || id !== lastFrameId) {
+        // A texture's size is fixed once allocated: drop it so three.js reallocates at the new size.
+        if (sourceCanvas.width !== texW || sourceCanvas.height !== texH) {
+          texW = sourceCanvas.width; texH = sourceCanvas.height;
+          uniforms.aspect.value = texW / texH; // 16:9 when the emulator outputs widescreen
+          tex.dispose();
+        }
+        tex.needsUpdate = true; changed = true;
+      }
       lastFrameId = id;
     }
 
@@ -427,7 +461,7 @@ export function createCrtTv({ sourceCanvas, frameId, width = 0.7, style = "grey"
   }
 
   return {
-    object3d, update, setPower, setSignal, setCrtEffect,
+    object3d, update, setPower, setSignal, setCrtEffect, setCrtParams,
     enterFullscreen, exitFullscreen, isFullscreen: () => fs.active, dispose,
   };
 }

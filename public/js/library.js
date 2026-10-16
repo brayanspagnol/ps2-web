@@ -1190,7 +1190,7 @@ function customGame(id, entry) {
     description: `Jogo adicionado por você a partir do arquivo ${entry.originalName || entry.fileName}${entry.serial ? ` (disco ${entry.serial})` : ""}.` };
 }
 
-export function createLibraryUI(container, { onPlay } = {}) {
+export function createLibraryUI(container, { onPlay, onSettings } = {}) {
   if (!document.getElementById("ps2l-style")) {
     const st = document.createElement("style");
     st.id = "ps2l-style";
@@ -1206,6 +1206,7 @@ export function createLibraryUI(container, { onPlay } = {}) {
       <p class="ps2l-count"></p>
       <p class="ps2l-hint">Jogos da pasta games/ aparecem sozinhos · ou arraste um .iso, .cso, .chd ou .bin para cá</p>
       <button type="button" class="ps2l-btn" data-act="import-any">Importar arquivo</button>
+      ${onSettings ? `<button type="button" class="ps2l-btn" data-act="settings" aria-haspopup="dialog">Configurações</button>` : ""}
     </header>
     <div class="ps2l-stage" role="group" aria-roledescription="carrossel" aria-label="Estante de jogos. Use as setas para navegar.">
       <div class="ps2l-shelf" aria-hidden="true"></div>
@@ -1417,6 +1418,7 @@ export function createLibraryUI(container, { onPlay } = {}) {
     if (act.dataset.dir) return select(sel + Number(act.dataset.dir), false);
     switch (act.dataset.act) {
       case "import-any": pendingGameId = null; input.click(); break;
+      case "settings": onSettings?.(); break;
       case "main": activate(); break;
       case "cancel": abort?.abort(); break;
       case "remove": {
