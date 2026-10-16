@@ -10,3 +10,4 @@
 /public/emu-*/
 
 __pycache__/
+isolate-*-v8.log
