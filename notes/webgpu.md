@@ -115,8 +115,13 @@ into a render pass on the GS thread's OffscreenCanvas `webgpu` context, then the
   1024-slot ring (32-bit CLUTs stored as whole colors); CLUTs whose memory the CPU copy holds (small host
   transfers, `m_cpuValid`) are built on the CPU (`LoadClutFromCpu`).
 - `Source/ui_js/GSH_WebGPU.js` (`--pre-js`): `GsWgpu` (device, buffers, pipelines, `execute()`), all WGSL;
-  two compute modules (8x8 and 16x16 draw tiles). `drawFeatures` = override constants of the specialized
-  draw pipelines.
+  one compute module (8x8 draw tiles). `drawFeatures` = override constants of the specialized draw pipelines.
+  `drawConfig.noDecode` ignores the decoded textures (A/B on the same capture: hashes must match).
+- Decoded textures (`CGSH_WebGPU::DecodeBatchTextures`, `texDecode` shader): per batch, textures whose primitives'
+  bounding box area >= texel count (level 0, repeat/clamp, not memory copies) are decoded to 32-bit colors (CLUT
+  and TEXA applied) in a 16 MB buffer before the draw; `STATE_TEX_DECODED` (state word 36) = 1 + offset. State
+  records are per batch (`m_batch.stateStart`). `DRAW_FEATURE_TEXDECODED` (bit 19); the format bits are then
+  those of the non-decoded textures only.
 - `Source/ui_js/Main.cpp`: `Module.gsBackend = "webgpu"` before `initVm` picks the backend;
   `Module.setGsDebug(1)` logs stats from the GS worker every 2 s (frames/s, submits, batches, prims, upload,
   JS time and GPU time per submit), `setGsDebug(2|1)` captures a frame (`Module.onGsCapture(object)` on the
@@ -189,3 +194,28 @@ into a render pass on the GS thread's OffscreenCanvas `webgpu` context, then the
   and texture sampling (~25% of a GoW frame).
   M3: FFX mtvu-ffx renders like WebGL2 (credits scene, field + characters + text); GoW gow-fight shows the
   shadows and correct colors (WebGL2 shows shadow artifacts there); gow-title and car match WebGL2.
+- 2026-10-19 (later) GoW parity attempt (commits 28d708a7, bb5bc818 on `webgpu`, then merges of web-perf 2ed06e87
+  and 83f0271f). Replay breakdown of a GoW gow-fight frame (`v/` variants in scratchpad `wgpu/`, ratios vs base):
+  no shading 0.38 (tile setup + coverage + write back; coverage alone ~1/4 of that), shading up to the depth
+  test 0.72 (prim loads 0.16, state loads + depth 0.18), texturing 0.22, bilinear vs point 0.18; ALU parts
+  (weights, blending, interpolation) 1-4% each. 58% of shaded fragments pass the depth test, 98% of those blend.
+  Main triangle pass = 60-75% of the frame GPU time, ~40 full screen passes (shadow channel shuffles) most of the
+  rest; 32 MB of OP_MEMORY_TO_COPY and 7 MB of uploads per frame (copies ~1%, prim upload ~7% of replay wall).
+  Kept: decoded textures (frame replay 0.83x, same hash), analytic coverage rows (0.97x, same hash).
+  Tried and dropped: per-pixel "direct" draws without tile lists for batches of <= 4/16 full screen primitives
+  (no gain, and worse with 16 strips: the cost is the per-pixel shading chain, not the tile setup); software
+  pipelined primitive loads (108 spills, 1.5x slower). Note: shader changes outside shade() can still change the
+  output hash slightly (codegen of the float interpolation), so hash equality only holds for changes that keep
+  shade()'s code.
+  In game (in-game GPU time: the GS thread waits 8-16 ms per frame for the GPU with MAX_FRAMES_IN_FLIGHT = 2, so
+  GoW is GPU-bound; the iGPU clock sits at 350-950 MHz while the CPU is busy), ms per vblank, `nolimit=1&time=100,700`,
+  alternated, machine shared with another agent:
+  gow-fight GL 19.4 / 19.1 vs WebGPU 25.7 / 25.7 (+33%); car GL 41.5 / 40.4 / 45.8 vs 40.4 / 42.0 (one 54.9 outlier),
+  about parity to -5%; mtvu-ffx GL 29.0 / 28.6 vs 29.6 / 30.6 / 29.6 (+3%); gow-title GL 9.7 / 9.9 vs 12.7 / 11.0 (+12-31%). The merged build (web-perf 83f0271f) renders GoW fine.
+  Decision: WebGPU is NOT the default (GoW 30% slower, overall slower; visuals are only better in GoW's shadows).
+  The site keeps WebGL2 with `?gs=webgpu` opt-in. Prepared but not applied (emulator.js): pick WebGPU when
+  `requestAdapter()` + `requestDevice()` succeed, `?gs=webgl` forces WebGL2, and `Module.onGsDeviceLost` (sent by
+  GsWgpu on device loss or failed init since bb5bc818) sets a sessionStorage flag and reloads on WebGL2.
+  What would close the gap: the per-fragment chain (prim + state loads, then texture) is ~5-10x a hardware
+  rasterizer's cost on this iGPU; remaining ideas are a hardware-rasterized path for batches whose result doesn't
+  depend on order (no blending/alpha test, depth test with writes) and smaller primitive records.
