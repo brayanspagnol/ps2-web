@@ -15,3 +15,6 @@ isolate-*-v8.log
 # Optional user-supplied boot intro video / sound / logo (never Sony assets in the repo)
 /public/assets/ps2-boot.*
 /public/assets/ps2-logo.*
+
+# The user's own console BIOS dump never goes into the repo
+/bios/
