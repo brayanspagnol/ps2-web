@@ -313,7 +313,18 @@ export function createCrtTv({ sourceCanvas, frameId, onCrtChange, width = 0.7, s
     return new Promise((resolve) => { anim = { keys: on ? ON_KEYS : OFF_KEYS, t: 0, resolve }; });
   }
 
-  function setSignal(on) { signal = !!on; uniforms.signal.value = signal ? 1 : 0; }
+  function setSignal(on) { signal = !!on; uniforms.signal.value = signal || overlay ? 1 : 0; }
+
+  // Shows another texture (e.g. the boot intro's render target, 4:3, raw sRGB values) instead of the
+  // emulator, redrawn every frame; null goes back to the emulator.
+  let overlay = null;
+  function setOverlay(texture) {
+    overlay = texture || null;
+    uniforms.tSrc.value = overlay ?? tex;
+    if (overlay) uniforms.aspect.value = 4 / 3; else uniforms.aspect.value = texW / texH;
+    setSignal(signal);
+    dirty = true;
+  }
 
   // ---- fullscreen -------------------------------------------------------------
   const fs = { active: false, el: null, renderer: null, scene: null, cam: null, crtBtn: null, idle: 0 };
@@ -402,7 +413,7 @@ export function createCrtTv({ sourceCanvas, frameId, onCrtChange, width = 0.7, s
   // so the caller can skip redrawing it.
   function update(dt /* , renderer */) {
     uniforms.time.value += dt;
-    let changed = dirty || !!anim || (powered && !signal); // power animation / static noise move every frame
+    let changed = dirty || !!anim || !!overlay || (powered && !signal); // power animation / static noise / overlay move every frame
     dirty = false;
     let p;
     if (anim) {
@@ -415,7 +426,7 @@ export function createCrtTv({ sourceCanvas, frameId, onCrtChange, width = 0.7, s
     uniforms.power.value.set(p[0], p[1], p[2]);
 
     // Upload the emulator's latest frame only when it can be seen and is new.
-    if (signal && (powered || anim)) {
+    if (signal && !overlay && (powered || anim)) {
       const id = frameId?.() ?? null;
       if (id === null || id !== lastFrameId) {
         // A texture's size is fixed once allocated: drop it so three.js reallocates at the new size.
@@ -461,7 +472,7 @@ export function createCrtTv({ sourceCanvas, frameId, onCrtChange, width = 0.7, s
   }
 
   return {
-    object3d, update, setPower, setSignal, setCrtEffect, setCrtParams,
+    object3d, update, setPower, setSignal, setOverlay, setCrtEffect, setCrtParams,
     enterFullscreen, exitFullscreen, isFullscreen: () => fs.active, dispose,
   };
 }

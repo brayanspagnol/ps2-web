@@ -48,12 +48,12 @@ export const DEFAULTS = {
   resFactor: 2, bilinear: false, widescreen: false, fill: false,
   crt: true, scanlines: 1, curvature: 1, bloom: 1,
   volume: 1, muted: false,
-  frameLimit: true,
+  frameLimit: true, intro: true,
   keys: {}, pad: {}, // control id -> key code / gamepad button, only where it differs from the default
 };
 const RANGES = { resFactor: [1, 4], scanlines: [0, 2], curvature: [0, 2], bloom: [0, 2], volume: [0, 1] };
 const GROUP = { resFactor: "gs", bilinear: "gs", widescreen: "gs", fill: "gs", crt: "crt", scanlines: "crt",
-  curvature: "crt", bloom: "crt", volume: "audio", muted: "audio", frameLimit: "limit" };
+  curvature: "crt", bloom: "crt", volume: "audio", muted: "audio", frameLimit: "limit", intro: "intro" };
 
 // localStorage is untrusted input (old versions, edits by hand): keep only valid values.
 function sanitize(raw) {
@@ -222,6 +222,7 @@ export function createSettings({ tv, getModule, onChange, onClose } = {}) {
       </section>
       <section aria-labelledby="ps2s-h-adv">
         <h3 id="ps2s-h-adv">Avançado</h3>
+        ${row("intro", "Abertura do PS2", "Animação e som de abertura na TV enquanto o jogo carrega. Qualquer tecla, clique ou botão pula.", toggle("intro"))}
         ${row("frameLimit", "Limitar a velocidade", "Desligado, jogos leves rodam acelerados e o som pode falhar. Para testes.", toggle("frameLimit"))}
       </section>
     </div>

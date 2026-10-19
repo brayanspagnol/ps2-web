@@ -55,6 +55,7 @@
   import { createCrtTv } from "./js/crt-tv.js";
   import { createLibraryUI, renderDiscLabel } from "./js/library.js";
   import { createSettings, keyHint } from "./js/settings.js";
+  import { startBootIntro } from "./js/boot-intro.js";
 
   const $ = (id) => document.getElementById(id);
   const msg = (text, err = false) => { $("msg").textContent = text; $("msg").className = err ? "err" : ""; };
@@ -87,18 +88,23 @@
   async function play(game, file) {
     if (busy) return;
     busy = true;
+    let intro = null; // PS2 boot intro on the TV while the game boots (hides the black boot screen)
     try {
       library.hide();
       $("library").hidden = true;
       msg("");
       await view.insertDisc({ id: game.id, title: game.title, color: game.palette?.accent ?? "#5aa9ff", labelCanvas: renderDiscLabel(game) });
       tv.setSignal(false);
+      if (settings.settings.intro) intro = startBootIntro({ view, tv, disc: file, sourceCanvas: $("outputCanvas"), frameId: emu.frameId,
+        volume: () => (settings.settings.muted ? 0 : settings.settings.volume) });
       await Promise.all([tv.setPower(true), view.focusTv()]);
       await emuReady;
       await emu.boot(file);
+      await intro?.done;
       tv.setSignal(true);
       showHud();
     } catch (e) {
+      intro?.cancel();
       console.error(e);
       msg(`Falha ao iniciar ${game.title}: ${e.message}`, true);
       await backToLibrary();

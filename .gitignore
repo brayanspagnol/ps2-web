@@ -11,3 +11,7 @@
 
 __pycache__/
 isolate-*-v8.log
+
+# Optional user-supplied boot intro video / sound / logo (never Sony assets in the repo)
+/public/assets/ps2-boot.*
+/public/assets/ps2-logo.*
