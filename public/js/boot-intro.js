@@ -423,7 +423,7 @@ export function startBootIntro({ view, tv, disc, sourceCanvas, frameId, volume =
   let t = 0;                                  // animation time (frozen with reduced motion / during the video)
   let assetsKnown = false, noField = false;
   const setLogo = ({ tex, half, sweep }) => {
-    if (finished) return tex.dispose();
+    if (finished || videoUsed) return tex.dispose();
     logoU.map.value = tex;
     logoU.halfSize.value.set(half[0], half[1]);
     logoU.sweepAmt.value = sweep;
@@ -444,7 +444,7 @@ export function startBootIntro({ view, tv, disc, sourceCanvas, frameId, volume =
   const videoU = { ...U, map: { value: null }, halfSize: { value: new THREE.Vector2(1, 1) }, on: { value: 0 } };
   const videoMesh = quad(mat({ uniforms: videoU, vertexShader: LOGO_VERT, fragmentShader: VIDEO_FRAG, depthTest: false }), 5);
   videoMesh.visible = false;
-  let video = null, videoTex = null;
+  let video = null, videoTex = null, videoUsed = false;
   function startVideo(url) {
     video = document.createElement("video");
     video.src = url;
@@ -476,7 +476,16 @@ export function startBootIntro({ view, tv, disc, sourceCanvas, frameId, volume =
     videoU.map.value = null;
     videoMesh.visible = false;
     videoU.on.value = 0;
-    if (fallback === true) { t = 0; startSound(null); } else { t = Math.max(t, LOGO_T - 0.5); noField = true; }
+    if (fallback === true) { t = 0; startSound(null); return; }
+    // The video is the whole original sequence, logo and chime included: no second logo, then
+    // black (like the console while the game loads) until the game's first frame.
+    videoUsed = true;
+    logoMesh.visible = false;
+    logoU.map.value?.dispose();
+    logoU.map.value = null;
+    chime = null;
+    noField = true;
+    logoStart = t - LOGO_IN - LOGO_HOLD;
   }
 
   // ---- sound ----
