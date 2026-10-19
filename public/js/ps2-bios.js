@@ -330,13 +330,25 @@ function extractInWorker(buf) {
 }
 
 let introP = null;
-// The extracted startup screen ({ version, source, sounds, textures }) or null (no BIOS / unusable).
-// Cached for the page; forgetBiosIntro() after the file changes.
+// The extracted startup screen ({ version, source, sounds, textures }) or null (no BIOS / unusable),
+// with the reason logged to the console. Cached for the page; forgetBiosIntro() after the file changes.
 export function biosIntro() {
-  introP ??= readBios().then((b) => b && extractInWorker(b.buf).then((r) => ({ ...r, source: b.source }))).catch((e) => {
-    console.warn("BIOS intro unavailable, using the recreation:", e.message);
-    return null;
-  });
+  introP ??= (async () => {
+    const t0 = performance.now();
+    const b = await readBios();
+    if (!b) {
+      console.info("Boot intro: no BIOS saved in this browser" + (isLocal() ? " and no bios/*.bin on the dev server" : "") + ", using the recreation.");
+      return null;
+    }
+    try {
+      const r = await extractInWorker(b.buf);
+      console.info(`Boot intro: BIOS ${r.version} (${b.source}) extracted in ${Math.round(performance.now() - t0)} ms.`);
+      return { ...r, source: b.source };
+    } catch (e) {
+      console.warn(`Boot intro: the BIOS (${b.source}) could not be used, using the recreation:`, e.message);
+      return null;
+    }
+  })();
   return introP;
 }
 export const forgetBiosIntro = () => { introP = null; };

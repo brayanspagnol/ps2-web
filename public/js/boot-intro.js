@@ -26,6 +26,7 @@ const LOGO_HOLD = 2;         // minimum time on the logo
 const MIN_T_REDUCED = 2;
 const HOLD_CAP = 20;         // s past the end: give up waiting for a non-black frame (game shows black)
 const FADE_MS = 450;
+const BIOS_WAIT_MS = 15000; // safety cap only (extraction takes ~0.5 s, a few s while the game boots)
 const SCE_LEN = 8;           // BIOS startup screen length; the timeline starts at -SCE_LEN (towers at 0)
 const ASSETS = new URL("../assets/", import.meta.url);
 
@@ -42,8 +43,9 @@ function probeAssets() {
   })();
   return assetsP;
 }
-// The BIOS intro is extracted in a worker once the page is idle, so it is ready when a game starts.
-setTimeout(() => (window.requestIdleCallback ?? setTimeout)(() => biosIntro()), 1500);
+// The BIOS intro is extracted in a worker once the page is idle (at most 2.5 s after load), so it is
+// usually ready when a game starts; startBootIntro waits for it otherwise.
+(window.requestIdleCallback ?? setTimeout)(() => biosIntro(), { timeout: 2500 });
 let pngP = null;
 const loadPng = () => (pngP ??= new Promise((res) => {
   const img = new Image();
@@ -543,9 +545,14 @@ export function startBootIntro({ view, tv, disc, sourceCanvas, frameId, volume =
     soundEnd = synth(ctx, master, ctx.currentTime + 0.05);
   }
 
-  // The timeline waits (t = 0) until the optional assets are known (at most 0.6 s, under the TV power-on).
-  Promise.race([Promise.all([probeAssets(), biosIntro()]), new Promise((r) => setTimeout(() => r([{}, null]), 600))]).then(([{ video: url, audio }, b]) => {
+  // The timeline waits (t = 0, black under the TV power-on) until the optional assets are known and,
+  // with a BIOS, until it is extracted: a BIOS that is still being read is waited for, never replaced
+  // by the recreation (only a missing or unusable BIOS falls back, with the reason in the console).
+  const waitCap = new Promise((r) => setTimeout(() => r("timeout"), BIOS_WAIT_MS));
+  Promise.all([probeAssets(), Promise.race([biosIntro(), waitCap])]).then(([{ video: url, audio }, b]) => {
     if (finished) return;
+    if (b === "timeout") { console.warn(`Boot intro: the BIOS was not extracted within ${BIOS_WAIT_MS / 1000} s, using the recreation.`); b = null; }
+    if (b && (url || reduced)) console.info(`Boot intro: BIOS intro not used (${url ? "user video in assets/" : "reduced motion"}).`);
     assetsKnown = true;
     t = reduced || skip ? Math.max(t, LOGO_T + LOGO_IN) : 0;
     if (skip) return;
