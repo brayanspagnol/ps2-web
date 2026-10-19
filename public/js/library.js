@@ -1,14 +1,12 @@
 // Game library: curated catalog (metadata + bundled box art in public/covers),
-// the user's own dumps streamed from serve.py's games/ folder or imported into
-// OPFS, SYSTEM.CNF serial detection, cover/disc art and the shelf UI.
-// Nothing here downloads games or BIOS from the internet.
+// the player's own disc images (picked from their computer and read in place, or
+// streamed from serve.py's games/ folder in local development), SYSTEM.CNF serial
+// detection, cover/disc art and the shelf UI.
+// Nothing here uploads the player's files or downloads games or BIOS from the internet.
 
 // Kept in sync with SUPPORTED_EXTENSIONS in emulator.js (not imported: that
 // module pulls in the whole Play! glue code).
 const EXTENSIONS = [".iso", ".cso", ".chd", ".isz", ".bin", ".elf"];
-const STORE_DIR = "ps2-library";
-const INDEX_FILE = "index.json";
-const QUOTA_MARGIN = 16 * 1024 * 1024;
 
 // ---------------------------------------------------------------- catalog
 // Serials in canonical form "SLUS-20946". Only serials we're confident about;
@@ -136,34 +134,30 @@ function extOf(name) {
   return dot === -1 ? "" : name.slice(dot).toLowerCase();
 }
 
-// ---------------------------------------------------------------- storage (OPFS)
-function libError(message, code, extra) {
-  return Object.assign(new Error(message), { code }, extra);
-}
+// ---------------------------------------------------------------- the player's own files
+// Games the player added from their computer. The file is never copied or uploaded: the shelf keeps
+// its name, size and serial in IndexedDB plus, where the File System Access API exists (Chrome, Edge),
+// its FileSystemFileHandle, so the game reopens later after a permission prompt. Elsewhere the File
+// only lives for this page session and the player picks it again next time.
+const DB_NAME = "ps2-web", DB_STORE = "games";
+const sessionFiles = new Map(); // entry id -> File picked or reopened in this page session
+const memEntries = new Map();   // entries kept for this session only when IndexedDB is unavailable
 
-async function storeDir() {
-  if (!navigator.storage?.getDirectory) {
-    throw libError("Este navegador não oferece armazenamento local de arquivos (OPFS). Use uma versão recente do Chrome, Edge, Brave ou Firefox.", "NO_OPFS");
-  }
-  const root = await navigator.storage.getDirectory();
-  return root.getDirectoryHandle(STORE_DIR, { create: true });
-}
-
-async function readIndex(dir) {
-  try {
-    const file = await (await dir.getFileHandle(INDEX_FILE)).getFile();
-    return JSON.parse(await file.text());
-  } catch (e) {
-    if (e.name === "NotFoundError") return {};
-    throw e;
-  }
-}
-
-// ponytail: index rewritten whole and imports aren't locked against each other; fine for one tab.
-async function writeIndex(dir, index) {
-  const w = await (await dir.getFileHandle(INDEX_FILE, { create: true })).createWritable();
-  await w.write(JSON.stringify(index));
-  await w.close();
+function dbRun(mode, fn) {
+  return new Promise((resolve, reject) => {
+    const open = indexedDB.open(DB_NAME, 1);
+    open.onupgradeneeded = () => open.result.createObjectStore(DB_STORE, { keyPath: "id" });
+    open.onerror = () => reject(open.error);
+    open.onsuccess = () => {
+      const db = open.result;
+      try {
+        const tx = db.transaction(DB_STORE, mode);
+        const req = fn(tx.objectStore(DB_STORE));
+        tx.oncomplete = () => { db.close(); resolve(req.result); };
+        tx.onerror = tx.onabort = () => { db.close(); reject(tx.error); };
+      } catch (e) { db.close(); reject(e); }
+    };
+  });
 }
 
 export function formatBytes(n) {
@@ -173,95 +167,57 @@ export function formatBytes(n) {
   return `${n.toLocaleString("pt-BR", { maximumFractionDigits: i > 1 ? 1 : 0 })} ${units[i]}`;
 }
 
-// onProgress(bytesWritten, totalBytes). gameId: catalog id, an existing
-// "custom-*" id, or "custom" to create a new entry titled after the file.
-export async function importFile(file, { onProgress, gameId, signal } = {}) {
-  if (!file || typeof file.stream !== "function") throw libError("Nenhum arquivo selecionado.", "NO_FILE");
-  const ext = extOf(file.name);
-  if (!EXTENSIONS.includes(ext)) {
-    throw libError(`Formato não suportado (${ext || file.name}). Use ${EXTENSIONS.join(", ")}.`, "UNSUPPORTED_FORMAT");
+const fileTitle = (name) => name.slice(0, name.length - extOf(name).length).replace(/[_.]+/g, " ").trim() || name;
+
+// Adds (or refreshes) a game from a File the player picked; handle: its FileSystemFileHandle, if any.
+export async function addLocalGame(file, handle = null) {
+  const ext = extOf(file?.name ?? "");
+  if (!file || !EXTENSIONS.includes(ext)) {
+    throw new Error(`Formato não suportado (${ext || file?.name || "nenhum arquivo"}). Use ${EXTENSIONS.join(", ")}.`);
   }
-  const dir = await storeDir();
   const serial = await detectSerial(file).catch(() => null);
-
-  let id = gameId;
-  let title;
-  if (!id) {
-    id = findBySerial(serial)?.id;
-    if (!id) {
-      throw libError(
-        serial ? `O disco ${serial} não está no catálogo. Escolha qual jogo é.` : "Não foi possível identificar o jogo automaticamente. Escolha qual jogo é.",
-        "NEEDS_GAME_CHOICE", { serial });
-    }
-  }
-  if (id === "custom") {
-    id = `custom-${Date.now().toString(36)}`;
-    title = file.name.slice(0, file.name.length - ext.length).replace(/[_.]+/g, " ").trim() || "Jogo importado";
-  } else if (!id.startsWith("custom-") && !GAMES.some((g) => g.id === id)) {
-    throw libError(`Jogo desconhecido: ${id}.`, "UNKNOWN_GAME");
-  }
-
-  const index = await readIndex(dir);
-  const previous = index[id];
-  const { quota = 0, usage = 0 } = await navigator.storage.estimate();
-  const free = quota - usage + (previous?.size ?? 0);
-  if (file.size + QUOTA_MARGIN > free) {
-    throw libError(
-      `Espaço insuficiente: o arquivo tem ${formatBytes(file.size)}, mas o navegador só libera ${formatBytes(Math.max(0, free))} para este site. Libere espaço no disco ou remova jogos da biblioteca.`,
-      "QUOTA_EXCEEDED", { gameId: id, title, serial });
-  }
-  await navigator.storage.persist?.().catch(() => false);
-
-  const fileName = id + ext;
-  const handle = await dir.getFileHandle(fileName, { create: true });
-  const writable = await handle.createWritable(); // writes go to a swap file until close()
-  let written = 0;
-  onProgress?.(0, file.size);
+  const entry = { id: `local-${file.name}-${file.size}`, name: file.name, size: file.size, serial, addedAt: Date.now(), handle };
+  sessionFiles.set(entry.id, file);
   try {
-    await file.stream()
-      .pipeThrough(new TransformStream({
-        transform(chunk, ctrl) { written += chunk.byteLength; onProgress?.(written, file.size); ctrl.enqueue(chunk); },
-      }))
-      .pipeTo(writable, { signal });
+    await dbRun("readwrite", (s) => s.put(entry));
   } catch (e) {
-    await writable.abort().catch(() => {});
-    if (!previous || previous.fileName !== fileName) await dir.removeEntry(fileName).catch(() => {});
-    if (e.name === "AbortError") throw libError("Importação cancelada.", "ABORTED");
-    if (e.name === "QuotaExceededError") throw libError("O espaço de armazenamento acabou durante a cópia. Libere espaço e tente de novo.", "QUOTA_EXCEEDED");
-    throw libError(`Falha ao copiar o arquivo: ${e.message}`, "WRITE_FAILED");
+    console.warn("Library: could not save the game, keeping it for this session only:", e);
+    memEntries.set(entry.id, entry);
   }
-  if (previous && previous.fileName !== fileName) await dir.removeEntry(previous.fileName).catch(() => {});
-
-  index[id] = { fileName, size: file.size, serial, importedAt: Date.now(), originalName: file.name, ...(title ? { title } : previous?.title ? { title: previous.title } : {}) };
-  await writeIndex(dir, index);
-  return { gameId: id, serial };
+  return entry;
 }
 
-export async function listOwned() {
-  const index = await readIndex(await storeDir());
-  return new Map(Object.entries(index));
+export async function listLocalGames() {
+  let list = [];
+  try { list = await dbRun("readonly", (s) => s.getAll()); } catch { /* no IndexedDB */ }
+  for (const e of memEntries.values()) if (!list.some((x) => x.id === e.id)) list.push(e);
+  return list.sort((a, b) => a.addedAt - b.addedAt);
 }
 
-export async function getGameFile(gameId) {
-  const dir = await storeDir();
-  const entry = (await readIndex(dir))[gameId];
-  if (!entry) throw libError("Este jogo não está na biblioteca. Importe o seu disco primeiro.", "NOT_OWNED");
+// Forgets the game (the file on the player's computer is not touched).
+export async function removeLocalGame(id) {
+  sessionFiles.delete(id);
+  memEntries.delete(id);
+  await dbRun("readwrite", (s) => s.delete(id)).catch(() => {});
+}
+
+// True when localGameFile() can open the file without the player picking it again.
+export const canReopen = (entry) => sessionFiles.has(entry.id) || !!entry.handle;
+
+// The File behind an entry, or null when the player has to pick it again. With a stored handle
+// this asks for read permission, so call it from a click (the browser shows its prompt).
+export async function localGameFile(entry) {
+  const cached = sessionFiles.get(entry.id);
+  if (cached) return cached;
+  if (!entry.handle) return null;
   try {
-    return await (await dir.getFileHandle(entry.fileName)).getFile();
-  } catch (e) {
-    if (e.name === "NotFoundError") throw libError("O arquivo deste jogo sumiu do armazenamento do navegador. Importe o disco de novo.", "MISSING_FILE");
-    throw e;
-  }
-}
-
-export async function removeGame(gameId) {
-  const dir = await storeDir();
-  const index = await readIndex(dir);
-  const entry = index[gameId];
-  if (!entry) return;
-  await dir.removeEntry(entry.fileName).catch((e) => { if (e.name !== "NotFoundError") throw e; });
-  delete index[gameId];
-  await writeIndex(dir, index);
+    const opts = { mode: "read" };
+    if ((await entry.handle.queryPermission(opts)) !== "granted" && (await entry.handle.requestPermission(opts)) !== "granted") return null;
+    const file = await entry.handle.getFile();
+    if (file.size !== entry.size) return null; // another file now has that name
+    sessionFiles.set(entry.id, file);
+    return file;
+  } catch { return null; } // moved, deleted or permission prompt dismissed
 }
 
 // ---------------------------------------------------------------- local games folder (serve.py /games/)
@@ -341,13 +297,15 @@ const serialMemo = new Map(); // "name|size|mtime" -> serial (avoids re-reading 
 
 // Lists the user's dumps in the server's games/ folder. Each entry is
 // { gameId, game, file: RemoteFile, serial }. Empty when there is no such server.
+let noGamesServer = false; // a static host has no games/ listing: ask once per page, not on every refresh
 export async function listServerGames() {
+  if (noGamesServer) return [];
   let list;
   try {
     const res = await fetch(new URL("index.json", GAMES_URL), { cache: "no-store" });
-    if (!res.ok) return [];
+    if (!res.ok || !res.headers.get("content-type")?.includes("json")) { noGamesServer = true; return []; }
     list = await res.json();
-  } catch { return []; }
+  } catch { noGamesServer = true; return []; }
   const out = [], used = new Set();
   for (const { name, size, mtime } of list) {
     const ext = extOf(name);
@@ -358,8 +316,7 @@ export async function listServerGames() {
     const serial = serialMemo.get(key);
     let game = findBySerial(serial);
     if (!game || used.has(game.id)) { // unknown disc (or a second copy): own entry titled from the file name
-      const title = name.slice(0, name.length - ext.length).replace(/[_.]+/g, " ").trim() || name;
-      game = customGame(`server-${name}`, { title, originalName: name, serial });
+      game = customGame(`server-${name}`, { title: fileTitle(name), originalName: name, serial });
       game.description = `Disponível na pasta games/ do servidor: ${name}${serial ? ` (disco ${serial})` : ""}.`;
     }
     used.add(game.id);
@@ -1147,29 +1104,12 @@ const STYLE = `
 .ps2l-primary{background:var(--accent);border-color:transparent;color:#03101f !important;box-shadow:0 8px 30px -8px rgba(90,169,255,.7)}
 .ps2l-primary:hover{background:#7dbcff}
 .ps2l-danger[data-confirm]{background:rgba(255,107,107,.18);border-color:rgba(255,107,107,.6);color:#ffd2d2}
-.ps2l-progress{width:min(100%,460px);display:grid;grid-template-columns:1fr auto;gap:6px 12px;align-items:center;font-size:13px;color:var(--muted)}
-.ps2l-progress[hidden]{display:none}
-.ps2l-progress progress{grid-column:1/-1;width:100%;height:6px;appearance:none;-webkit-appearance:none;border:0;border-radius:999px;background:rgba(255,255,255,.1);overflow:hidden}
-.ps2l-progress progress::-webkit-progress-bar{background:rgba(255,255,255,.1)}
-.ps2l-progress progress::-webkit-progress-value{background:linear-gradient(90deg,#3d8bff,#7fd1ff);border-radius:999px}
-.ps2l-progress progress::-moz-progress-bar{background:linear-gradient(90deg,#3d8bff,#7fd1ff)}
-.ps2l-progress .ps2l-btn{min-height:32px;padding:0 14px;font-size:13px}
 .ps2l-msg{margin:0;min-height:1.4em;font-size:14px}
 .ps2l-msg[data-kind="error"]{color:var(--danger)}.ps2l-msg[data-kind="ok"]{color:var(--ok)}
 .ps2l-hint{margin:0;color:var(--muted);font-size:12px}
 .ps2l-drop{position:absolute;inset:12px;z-index:20;border:2px dashed rgba(90,169,255,.7);border-radius:20px;display:grid;place-items:center;
   background:rgba(5,10,20,.82);font-size:clamp(18px,3vw,26px);font-weight:600;pointer-events:none;text-align:center;padding:16px}
 .ps2l-drop[hidden]{display:none}
-.ps2l-dialog{max-width:min(520px,calc(100vw - 32px));width:100%;border:1px solid var(--line);border-radius:18px;padding:0;background:#0e1016;color:var(--fg);
-  box-shadow:0 30px 80px rgba(0,0,0,.7);font:15px/1.45 'Inter','Segoe UI',Roboto,'Helvetica Neue','Adwaita Sans','Noto Sans','DejaVu Sans',Arial,sans-serif}
-.ps2l-dialog::backdrop{background:rgba(0,0,0,.65);backdrop-filter:blur(3px)}
-.ps2l-dialog form{padding:22px;display:grid;gap:14px}
-.ps2l-dialog h2{margin:0;font-size:20px}
-.ps2l-dialog p{margin:0;color:var(--muted);font-size:14px}
-.ps2l-choices{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:8px;max-height:min(50vh,360px);overflow:auto;padding:4px}
-.ps2l-choice{min-height:44px;padding:8px 12px;border-radius:12px;border:1px solid var(--line);background:rgba(255,255,255,.04);cursor:pointer;text-align:left;font-size:14px;color:var(--fg)}
-.ps2l-choice:hover{background:rgba(90,169,255,.14);border-color:rgba(90,169,255,.5)}
-.ps2l-dialog .ps2l-row{display:flex;gap:10px;justify-content:flex-end;flex-wrap:wrap}
 .ps2l-sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
 @keyframes ps2l-float{50%{translate:0 -6px}}
 /* plays when a card gets selected, then rests: an endless loop kept the compositor busy on an idle shelf */
@@ -1187,9 +1127,18 @@ const STYLE = `
 const ICON = (d) => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="${d}"/></svg>`;
 
 function customGame(id, entry) {
-  return { id, title: entry.title || entry.originalName || "Jogo importado", year: "", genre: "Importado", custom: true, serials: entry.serial ? [entry.serial] : [],
-    description: `Jogo adicionado por você a partir do arquivo ${entry.originalName || entry.fileName}${entry.serial ? ` (disco ${entry.serial})` : ""}.` };
+  return { id, title: entry.title || entry.originalName || "Seu jogo", year: "", genre: "Seu disco", custom: true, serials: entry.serial ? [entry.serial] : [],
+    description: `Jogo adicionado por você a partir do arquivo ${entry.originalName}${entry.serial ? ` (disco ${entry.serial})` : ""}.` };
 }
+
+// Last card on the shelf: adds a game from the player's computer.
+const ADD_CARD = {
+  id: "add-game", title: "Adicionar jogo", year: "", genre: "Seu disco",
+  description: `Escolha a imagem de um disco seu (${EXTENSIONS.join(", ")}) no seu computador, ou arraste o arquivo para cá. ` +
+    "O jogo é lido direto do seu computador: o arquivo não é enviado para lugar nenhum.",
+  palette: { bg: ["#16233f", "#05070c"], accent: "#5aa9ff", ink: "#05070c", text: "#eef0f6" },
+  art: { motif: "custom", big: "Adicionar jogo", font: "800 {s}px 'Helvetica Neue', Arial, sans-serif", spacing: 0.02, tagline: "Seu disco · seu computador" },
+};
 
 export function createLibraryUI(container, { onPlay, onSettings } = {}) {
   if (!document.getElementById("ps2l-style")) {
@@ -1205,8 +1154,8 @@ export function createLibraryUI(container, { onPlay, onSettings } = {}) {
     <header class="ps2l-head">
       <div><p class="ps2l-kicker">Biblioteca</p><h1 class="ps2l-h">Seus jogos</h1></div>
       <p class="ps2l-count"></p>
-      <p class="ps2l-hint">Jogos da pasta games/ aparecem sozinhos · ou arraste um .iso, .cso, .chd ou .bin para cá</p>
-      <button type="button" class="ps2l-btn" data-act="import-any">Importar arquivo</button>
+      <p class="ps2l-hint">Use cópias dos seus próprios discos · o arquivo fica no seu computador, nada é enviado</p>
+      <button type="button" class="ps2l-btn" data-act="add">Adicionar jogo</button>
       ${onSettings ? `<button type="button" class="ps2l-btn" data-act="settings" aria-haspopup="dialog">Configurações</button>` : ""}
     </header>
     <div class="ps2l-stage" role="group" aria-roledescription="carrossel" aria-label="Estante de jogos. Use as setas para navegar.">
@@ -1221,42 +1170,22 @@ export function createLibraryUI(container, { onPlay, onSettings } = {}) {
       <p class="ps2l-desc"></p>
       <div class="ps2l-actions">
         <button type="button" class="ps2l-btn ps2l-primary" data-act="main"></button>
-        <button type="button" class="ps2l-btn ps2l-danger" data-act="remove">Remover</button>
-      </div>
-      <div class="ps2l-progress" hidden>
-        <progress max="1" value="0" aria-label="Progresso da importação"></progress>
-        <span class="ps2l-ptext" aria-live="polite"></span>
-        <button type="button" class="ps2l-btn" data-act="cancel">Cancelar</button>
+        <button type="button" class="ps2l-btn ps2l-danger" data-act="remove">Tirar da estante</button>
       </div>
       <p class="ps2l-msg" role="status" aria-live="polite"></p>
     </div>
-    <div class="ps2l-drop" hidden>Solte o arquivo do seu disco para importar</div>
-    <dialog class="ps2l-dialog" aria-labelledby="ps2l-dlg-h">
-      <form method="dialog">
-        <h2 id="ps2l-dlg-h">Qual jogo é este?</h2>
-        <p class="ps2l-dlg-p"></p>
-        <div class="ps2l-choices"></div>
-        <div class="ps2l-row">
-          <button class="ps2l-btn" value="">Cancelar</button>
-          <button class="ps2l-btn ps2l-primary" value="custom">Outro jogo</button>
-        </div>
-      </form>
-    </dialog>
-    <input type="file" hidden accept="${EXTENSIONS.join(",")}">`;
+    <div class="ps2l-drop" hidden>Solte o arquivo do seu disco para colocá-lo na estante</div>
+    <input type="file" hidden accept="${EXTENSIONS.join(",")}" aria-label="Arquivo do disco">`;
   container.append(root);
 
   const $ = (s) => root.querySelector(s);
-  const stage = $(".ps2l-stage"), input = $("input[type=file]"), dialog = $(".ps2l-dialog");
-  const mainBtn = $('[data-act="main"]'), removeBtn = $('[data-act="remove"]');
-  const progress = $(".ps2l-progress"), bar = progress.querySelector("progress"), ptext = $(".ps2l-ptext"), msg = $(".ps2l-msg");
+  const stage = $(".ps2l-stage"), input = $("input[type=file]");
+  const mainBtn = $('[data-act="main"]'), removeBtn = $('[data-act="remove"]'), msg = $(".ps2l-msg");
 
-  let games = [], owned = new Map(), server = new Map(), sel = 0, busy = false, abort = null, pendingGameId = null, confirmTimer = 0;
+  // games: shelf order (server dumps, then the player's files, then ADD_CARD).
+  let games = [], server = new Map(), local = new Map(), sel = 0, busy = false, repick = null, confirmTimer = 0;
   const cards = new Map(); // id -> button, covers rendered once
   const coverCache = new Map();
-
-  dialog.querySelector(".ps2l-choices").innerHTML = GAMES.map((g) => `<button class="ps2l-choice" value="${g.id}">${g.title}</button>`).join("");
-
-  const available = (id) => server.has(id) || owned.has(id);
 
   function say(text, kind = "") { msg.textContent = text; msg.dataset.kind = kind; }
 
@@ -1283,42 +1212,50 @@ export function createLibraryUI(container, { onPlay, onSettings } = {}) {
     return b;
   }
 
+  // -> [tag on the card, status line, main button label]
+  function describe(g) {
+    if (g === ADD_CARD) return ["", "O arquivo não sai do seu computador", "Escolher arquivo…"];
+    if (server.has(g.id)) return ["games/", `Na pasta games/ do servidor local · ${formatBytes(server.get(g.id).file.size)}`, "Jogar"];
+    const e = local.get(g.id);
+    return canReopen(e)
+      ? ["No computador", `No seu computador · ${formatBytes(e.size)}`, "Jogar"]
+      : ["No computador", `${e.name} · escolha o arquivo de novo para jogar`, "Escolher o arquivo…"];
+  }
+
   function layout() {
     games.forEach((g, i) => {
-      const b = cardFor(g), d = i - sel, ad = Math.abs(d), own = available(g.id);
+      const b = cardFor(g), d = i - sel, ad = Math.abs(d), [tag] = describe(g);
       b.style.setProperty("--x", d === 0 ? 0 : Math.sign(d) * (0.78 + ad * 0.46));
       b.style.setProperty("--z", -ad * 90);
       b.style.setProperty("--ry", d === 0 ? 0 : -Math.sign(d) * 42);
       b.style.zIndex = 100 - ad;
       b.toggleAttribute("data-sel", d === 0);
       b.toggleAttribute("data-far", ad > 4);
-      b.toggleAttribute("data-owned", own);
+      b.toggleAttribute("data-owned", true); // everything on the shelf is playable (the add card is not dimmed either)
       b.tabIndex = d === 0 ? 0 : -1;
       b.setAttribute("aria-current", d === 0 ? "true" : "false");
-      b.setAttribute("aria-label", `${g.title}${g.year ? `, ${g.year}` : ""}: ${server.has(g.id) ? "disponível" : own ? "na biblioteca" : "disco não importado"}. ${i + 1} de ${games.length}.`);
-      b.lastChild.textContent = server.has(g.id) ? "Disponível" : own ? "Na biblioteca" : "";
+      b.setAttribute("aria-label", `${g.title}${g.year ? `, ${g.year}` : ""}${tag ? `: ${tag.toLowerCase()}` : ""}. ${i + 1} de ${games.length}.`);
+      b.lastChild.textContent = tag;
     });
     const g = games[sel];
     if (!g) return;
-    const own = available(g.id);
+    const [, status, action] = describe(g);
     $(".ps2l-meta").textContent = [g.year, g.genre].filter(Boolean).join(" · ");
     $(".ps2l-title").textContent = g.title;
-    const status = $(".ps2l-status");
-    status.textContent = server.has(g.id) ? `Disponível · ${formatBytes(server.get(g.id).file.size)}`
-      : own ? `Na biblioteca · ${formatBytes(owned.get(g.id).size)}` : "Coloque o arquivo na pasta games/ ou importe seu disco";
-    status.toggleAttribute("data-owned", own);
+    const st = $(".ps2l-status");
+    st.textContent = status;
+    st.toggleAttribute("data-owned", g !== ADD_CARD);
     $(".ps2l-desc").textContent = g.description;
-    mainBtn.textContent = own ? "Jogar" : "Importar disco";
+    mainBtn.textContent = action;
     mainBtn.disabled = busy;
-    removeBtn.hidden = !owned.has(g.id); // only browser (OPFS) copies can be removed from here
+    removeBtn.hidden = !local.has(g.id); // server dumps are managed in the games/ folder
     removeBtn.disabled = busy;
     resetRemove();
-    const n = GAMES.filter((x) => available(x.id)).length;
-    $(".ps2l-count").textContent = `${n} de ${GAMES.length} jogos do catálogo disponíveis` + (games.length > GAMES.length ? ` · ${games.length - GAMES.length} extra` : "");
+    const n = games.length - 1;
+    $(".ps2l-count").textContent = n ? `${n} ${n === 1 ? "jogo" : "jogos"} na estante` : "Nenhum jogo ainda: adicione o seu";
   }
 
   function select(i, focus = true) {
-    if (!games.length) return;
     sel = Math.max(0, Math.min(games.length - 1, i));
     layout();
     if (focus && root.contains(document.activeElement) && document.activeElement.classList.contains("ps2l-card")) cards.get(games[sel].id).focus({ preventScroll: true });
@@ -1326,12 +1263,17 @@ export function createLibraryUI(container, { onPlay, onSettings } = {}) {
 
   async function refresh() {
     const current = games[sel]?.id;
-    const serverList = listServerGames();
-    try { owned = await listOwned(); } catch (e) { owned = new Map(); say(e.message, "error"); }
-    const fromServer = await serverList;
+    const [fromServer, entries] = await Promise.all([listServerGames(), listLocalGames()]);
     server = new Map(fromServer.map((s) => [s.gameId, s]));
-    const customs = [...owned].filter(([id]) => id.startsWith("custom-")).map(([id, e]) => customGame(id, e));
-    games = [...GAMES, ...customs, ...fromServer.filter((s) => s.game.custom).map((s) => s.game)];
+    local = new Map();
+    const mine = [];
+    for (const e of entries) {
+      let game = findBySerial(e.serial);
+      if (!game || server.has(game.id) || local.has(game.id)) game = customGame(e.id, { title: fileTitle(e.name), originalName: e.name, serial: e.serial });
+      local.set(game.id, e);
+      mine.push(game);
+    }
+    games = [...fromServer.map((s) => s.game), ...mine, ADD_CARD];
     for (const [id, b] of cards) if (!games.some((g) => g.id === id)) { b.remove(); cards.delete(id); }
     const i = games.findIndex((g) => g.id === current);
     sel = i === -1 ? Math.min(sel, games.length - 1) : i;
@@ -1341,75 +1283,63 @@ export function createLibraryUI(container, { onPlay, onSettings } = {}) {
   function resetRemove() {
     clearTimeout(confirmTimer);
     removeBtn.removeAttribute("data-confirm");
-    removeBtn.textContent = "Remover";
+    removeBtn.textContent = "Tirar da estante";
   }
 
   async function activate() {
     const g = games[sel];
     if (!g || busy) return;
-    if (server.has(g.id)) { onPlay?.(g, server.get(g.id).file); return; } // streamed from games/
-    if (!owned.has(g.id)) { pendingGameId = g.id; input.click(); return; }
+    if (g === ADD_CARD) return pick(null);
+    if (server.has(g.id)) return onPlay?.(g, server.get(g.id).file); // streamed from games/
+    const e = local.get(g.id);
+    const file = await localGameFile(e);
+    if (file) return onPlay?.(g, file);
+    say(`Escolha de novo o arquivo ${e.name} para jogar.`);
+    pick(e);
+  }
+
+  // Opens the file picker. repickFor: the shelf entry being reopened (plays as soon as it is picked).
+  async function pick(repickFor) {
+    repick = repickFor;
+    if (!window.showOpenFilePicker) return input.click();
+    let handle;
     try {
-      const file = await getGameFile(g.id);
-      onPlay?.(g, file);
-    } catch (e) { say(e.message, "error"); }
+      [handle] = await window.showOpenFilePicker({
+        id: "ps2-games",
+        types: [{ description: "Imagem de disco de PS2", accept: { "application/octet-stream": EXTENSIONS } }],
+      });
+    } catch (e) {
+      if (e.name !== "AbortError") { console.warn("File picker unavailable, using the file input:", e); input.click(); }
+      return;
+    }
+    addFile(await handle.getFile(), handle);
   }
 
-  function chooseGame(serial, file) {
-    dialog.querySelector(".ps2l-dlg-p").textContent = serial
-      ? `O disco ${serial} não está no catálogo. Escolha o jogo ou use “Outro jogo” para adicioná-lo com o nome do arquivo.`
-      : `Não deu para identificar “${file.name}” automaticamente (isso é normal em .cso, .chd e .isz). Escolha qual jogo é:`;
-    dialog.returnValue = "";
-    dialog.showModal();
-    return new Promise((res) => dialog.addEventListener("close", () => res(dialog.returnValue || null), { once: true }));
-  }
-
-  async function handleFile(file, gameId) {
+  async function addFile(file, handle = null) {
     if (busy || !file) return;
     busy = true;
-    abort = new AbortController();
-    say("");
+    say("Lendo o disco…");
     layout();
-    const onProgress = (done, total) => {
-      bar.value = total ? done / total : 0;
-      ptext.textContent = `${Math.floor((done / (total || 1)) * 100)}% · ${formatBytes(done)} de ${formatBytes(total)}`;
-    };
+    let play = null;
     try {
-      let result;
-      try {
-        progress.hidden = false;
-        bar.value = 0;
-        ptext.textContent = "Lendo o disco…";
-        result = await importFile(file, { gameId, onProgress, signal: abort.signal });
-      } catch (e) {
-        if (e.code !== "NEEDS_GAME_CHOICE") throw e;
-        progress.hidden = true;
-        const choice = await chooseGame(e.serial, file);
-        if (!choice) { say("Importação cancelada."); return; }
-        progress.hidden = false;
-        result = await importFile(file, { gameId: choice, onProgress, signal: abort.signal });
-      }
+      const e = await addLocalGame(file, handle);
       await refresh();
-      const i = games.findIndex((g) => g.id === result.gameId);
-      if (i !== -1) select(i, false);
-      say(`${games[sel].title} está na biblioteca.${result.serial ? ` Disco ${result.serial}.` : ""}`, "ok");
+      const id = [...local].find(([, x]) => x.id === e.id)?.[0];
+      select(games.findIndex((g) => g.id === id), false);
+      const g = games[sel];
+      if (repick?.id === e.id) { say(""); play = g; }
+      else say(`${g.title} está na estante${e.serial ? ` (disco ${e.serial})` : ""}. ` + (handle
+        ? "Da próxima vez ele abre daqui mesmo; o navegador só pede permissão para ler o arquivo."
+        : "Este navegador não guarda o acesso ao arquivo: da próxima vez que abrir o site, escolha o arquivo de novo."), "ok");
     } catch (e) {
-      // No room to keep a copy: play straight from the picked file (not saved).
-      if (e.code === "QUOTA_EXCEEDED" && e.gameId && onPlay) {
-        const g = GAMES.find((x) => x.id === e.gameId)
-          ?? customGame(e.gameId, { title: e.title, originalName: file.name, serial: e.serial });
-        say(`Sem espaço para salvar ${g.title} no navegador. Rodando direto do arquivo (será preciso escolhê-lo de novo na próxima vez).`);
-        onPlay(g, file);
-        return;
-      }
-      say(e.message, e.code === "ABORTED" ? "" : "error");
-      if (e.code !== "ABORTED") console.error(e);
+      say(e.message, "error");
+      console.error(e);
     } finally {
       busy = false;
-      abort = null;
-      progress.hidden = true;
+      repick = null;
       layout();
     }
+    if (play) onPlay?.(play, file);
   }
 
   // ---- events
@@ -1418,19 +1348,19 @@ export function createLibraryUI(container, { onPlay, onSettings } = {}) {
     if (!act || !root.contains(act)) return;
     if (act.dataset.dir) return select(sel + Number(act.dataset.dir), false);
     switch (act.dataset.act) {
-      case "import-any": pendingGameId = null; input.click(); break;
+      case "add": pick(null); break;
       case "settings": onSettings?.(); break;
       case "main": activate(); break;
-      case "cancel": abort?.abort(); break;
       case "remove": {
         if (!removeBtn.hasAttribute("data-confirm")) {
           removeBtn.setAttribute("data-confirm", "");
-          removeBtn.textContent = "Confirmar remoção";
+          removeBtn.textContent = "Confirmar";
           confirmTimer = setTimeout(resetRemove, 4000);
           return;
         }
         const g = games[sel];
-        removeGame(g.id).then(refresh).then(() => say(`${g.title} foi removido da biblioteca.`)).catch((err) => say(err.message, "error"));
+        removeLocalGame(local.get(g.id).id).then(refresh)
+          .then(() => say(`${g.title} saiu da estante. O arquivo continua no seu computador.`), (err) => say(err.message, "error"));
       }
     }
   };
@@ -1439,11 +1369,12 @@ export function createLibraryUI(container, { onPlay, onSettings } = {}) {
   input.addEventListener("change", () => {
     const f = input.files[0];
     input.value = "";
-    handleFile(f, pendingGameId);
+    if (f) addFile(f); else repick = null;
   });
+  input.addEventListener("cancel", () => (repick = null));
 
   const onKey = (e) => {
-    if (dialog.open || e.altKey || e.ctrlKey || e.metaKey) return;
+    if (e.altKey || e.ctrlKey || e.metaKey) return;
     if (e.target.closest?.("input,textarea,select,dialog")) return;
     const k = e.key;
     if (k === "ArrowLeft" || k === "ArrowRight") {
@@ -1481,7 +1412,7 @@ export function createLibraryUI(container, { onPlay, onSettings } = {}) {
   });
   stage.addEventListener("pointercancel", () => (downX = null));
 
-  // drag & drop anywhere on the overlay
+  // drag & drop anywhere on the overlay (Chrome/Edge also hand over a handle, so the game reopens later)
   const drop = $(".ps2l-drop");
   let dragDepth = 0;
   const hasFiles = (e) => [...(e.dataTransfer?.types ?? [])].includes("Files");
@@ -1493,7 +1424,9 @@ export function createLibraryUI(container, { onPlay, onSettings } = {}) {
     e.preventDefault();
     dragDepth = 0;
     drop.hidden = true;
-    handleFile(e.dataTransfer.files[0], null);
+    const file = e.dataTransfer.files[0];
+    const handle = e.dataTransfer.items?.[0]?.getAsFileSystemHandle?.(); // must be called during the event
+    Promise.resolve(handle).catch(() => null).then((h) => addFile(file, h?.kind === "file" ? h : null));
   });
 
   preloadCovers().finally(refresh); // covers first, so cards render with the real art
@@ -1502,6 +1435,6 @@ export function createLibraryUI(container, { onPlay, onSettings } = {}) {
     refresh,
     show() { root.hidden = false; },
     hide() { root.hidden = true; },
-    destroy() { abort?.abort(); clearTimeout(confirmTimer); root.remove(); },
+    destroy() { clearTimeout(confirmTimer); root.remove(); },
   };
 }
