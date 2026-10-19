@@ -198,6 +198,35 @@ the poll blocks as idle loops; patches are re-applied after a state load. The MT
 wall ms/vbl over vblanks 100-700 (2 ABAB rounds): gow-fight 28.4 -> 18.9 (-33%, 34 -> 53 vbl/s),
 gow-title 12.1 -> 8.5 (-30%); car.zip 39.4 -> 38.6 and mtvu-ffx 26.1 -> 24.5 (noise, hashes identical).
 
+## Native wasm exceptions, front VIF1 cl < wl skip (see notes/gta-profile.md)
+
+Two game-independent items from the GTA SA per-thread profile (Play `web-perf` 9301cd51 + 83f0271f, CodeGen 5e3b752):
+- **`-fwasm-exceptions`** (root `CMakeLists.txt`, compile + link, all targets; CodeGen's own build too). Play-Dependencies'
+  `Header.cmake` still adds `-fexceptions` (upstream submodule, no fork), but emcc lets `-fwasm-exceptions` win. With
+  JS exceptions every call that may throw from a frame with cleanups went wasm -> JS `invoke_*` -> wasm (the VM loop
+  calls every IOP block and EE slice that way): ~5.5% of the VM thread, 3.5% of VU1. Play.js now has no `invoke_`,
+  Play.wasm is 8% smaller. Needs Chrome 95+ / Firefox 100+ / Safari 15.2+ (the JIT already needs wasm SIMD, which is
+  newer). Error paths checked in Brave and Firefox: a C++ exception caught on the VM thread still fails cleanly
+  (`loadState` of a missing file -> `stateStatus()` 0, the game keeps running); an uncaught one thrown into JS
+  surfaces as a `WebAssembly.Exception`; an uncaught one on a pthread reaches the page's `error` event ("worker sent
+  an error!") as before.
+- **Front VIF1 `SkipUnpack` with CYCLE cl < wl** (filling write; GTA uses it): computed in one step instead of one
+  vector at a time (`Cmd_UNPACK` self was 4.6% of the VM thread). Read ticks are the first cl of each wl-tick group,
+  the first read without data stops it. A self-check against the loop (cl/wl 0..16 and wl = 0, all tick start
+  states, num 1..256, partial data: 280M cases; plus 20M random over cl/wl 0..255) gives identical num, ticks and
+  bytes consumed.
+
+State hashes (`hash=300&vu1thread=0&nolimit=1`) identical: car 55dab76e, mtvu-ffx 5927b89c, play 1f851c1c,
+gow-fight 718a88cc; play and car also identical with MTVU on (front path). Timing, release, MTVU on, no limiter,
+wall ms/vbl over vblanks 100-600, ABAB, 2 rounds, load 3-5 from other agents:
+
+| state | before | after |
+|---|---|---|
+| play.zip | 30.99 / 30.93 | 30.59 / 30.40 (-1.5%) |
+| car.zip | 42.00 / 39.32 | 39.65 / 40.41 (-1.5%, noisy) |
+
+The earlier A/B of the flag alone with the limiter on (30 s from vblank 600) gave -4.4% ms/vbl on play.zip.
+
 ## Tier-2 EE regions (not published, see notes/tier2-m2b.md)
 
 Hot EE entries compiled as regions (up to 16 tier-1 blocks of one 4 KB page in one structured wasm function,
