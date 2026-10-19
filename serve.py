@@ -18,6 +18,7 @@ from urllib.parse import unquote, urlsplit
 BASE = Path(__file__).resolve().parent
 GAMES_DIR = BASE / "games"
 GAME_EXTENSIONS = {".iso", ".cso", ".chd", ".isz", ".bin", ".elf"}
+BIOS_DIR = BASE / "bios"  # the developer's own console BIOS dump (gitignored), for the boot intro
 
 
 def parse_range(header, size):
@@ -73,12 +74,22 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         super().end_headers()
 
     def do_GET(self):
-        if self.host_check() and self.games_route(head=False) is None:
+        if self.host_check() and self.bios_route(head=False) is None and self.games_route(head=False) is None:
             super().do_GET()
 
     def do_HEAD(self):
-        if self.host_check() and self.games_route(head=True) is None:
+        if self.host_check() and self.bios_route(head=True) is None and self.games_route(head=True) is None:
             super().do_HEAD()
+
+    # /bios/dev.bin: the first bios/*.bin, only to this machine (a BIOS is never served to others).
+    def bios_route(self, head):
+        if urlsplit(self.path).path != "/bios/dev.bin":
+            return None
+        bins = sorted(BIOS_DIR.glob("*.bin")) if BIOS_DIR.is_dir() else []
+        if not bins or not ipaddress.ip_address(self.client_address[0]).is_loopback:
+            self.send_error(404, "Not found")
+            return True
+        return self.send_game(bins[0], head)
 
     def host_check(self):
         if host_allowed(self.headers.get("Host"), self.bind_host):

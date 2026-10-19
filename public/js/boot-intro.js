@@ -1,7 +1,11 @@
 // PlayStation 2 boot intro shown on the TV while the emulator boots the game.
+// 0. With the player's own BIOS dump (Configurações > Avançado, ps2-bios.js): the "Sony Computer
+//    Entertainment" screen with the console's original startup sound, text, fog, flare and glow
+//    textures taken from that BIOS (the motion is a recreation), then the towers with the BIOS's
+//    tower sound and the logo with its chime.
 // 1. Startup screen: a recreation (flash of light, dark-blue field of glowing translucent cube towers
-//    with drifting light, synthesized pad + chime). The real one lives in the console BIOS, which we
-//    don't have, so users can supply their own recording (gitignored, never in the repo):
+//    with drifting light, synthesized pad + chime; without a BIOS). Users can also supply their own
+//    recording (gitignored, never in the repo):
 //    public/assets/ps2-boot.mp4|.webm (video + audio, replaces the recreation) or
 //    public/assets/ps2-boot.ogg|.mp3|.wav (audio only, replaces the synthesized sound).
 // 2. The "PlayStation 2" logo: the original one, decoded from the disc itself (ps2-logo.js), faded in
@@ -13,6 +17,7 @@
 // click or gamepad button skips (as soon as the game has a frame). Everything is disposed at the end.
 import * as THREE from "three";
 import { decodeDiscLogo, LOGO_BYTES } from "./ps2-logo.js";
+import { biosIntro } from "./ps2-bios.js";
 
 const W = 640, H = 480;
 const LOGO_T = 4.6;          // logo starts fading in (synthetic timeline, seconds)
@@ -21,6 +26,7 @@ const LOGO_HOLD = 2;         // minimum time on the logo
 const MIN_T_REDUCED = 2;
 const HOLD_CAP = 20;         // s past the end: give up waiting for a non-black frame (game shows black)
 const FADE_MS = 450;
+const SCE_LEN = 8;           // BIOS startup screen length; the timeline starts at -SCE_LEN (towers at 0)
 const ASSETS = new URL("../assets/", import.meta.url);
 
 // ---- optional user assets (probed once per page; a missing file is one 404 in the network log) ----
@@ -36,6 +42,8 @@ function probeAssets() {
   })();
   return assetsP;
 }
+// The BIOS intro is extracted in a worker once the page is idle, so it is ready when a game starts.
+setTimeout(() => (window.requestIdleCallback ?? setTimeout)(() => biosIntro()), 1500);
 let pngP = null;
 const loadPng = () => (pngP ??= new Promise((res) => {
   const img = new Image();
@@ -127,6 +135,56 @@ void main() {
   gl_FragColor = vec4(vec3(0.5, 0.75, 1.0) * exp(-d * d * 22.0) * vA * fade * master, 1.0);
 }`;
 
+// BIOS startup screen ("Sony Computer Entertainment"): drifting fog layers, the flare ring opening
+// at the start, glowing motes and the text, all with the BIOS's own textures (motion recreated).
+const SCE_U = /* glsl */ `uniform float sceT, sceA, master, flareA, flareScale, textA, moteA;`;
+const SCE_FRAG = /* glsl */ `${SCE_U}
+uniform sampler2D fogA, fogB, fogC, flareMap;
+varying vec2 vUv;
+vec2 rot(vec2 p, float a) { float c = cos(a), s = sin(a); return mat2(c, -s, s, c) * p; }
+void main() {
+  vec2 p = (vUv - 0.5) * vec2(1.333, 1.0);
+  float f1 = texture2D(fogA, rot(p, sceT * 0.035) * 0.8 + vec2(0.5, 0.5 + sceT * 0.02)).r;
+  float f2 = texture2D(fogB, rot(p, -sceT * 0.05) * 1.3 + vec2(0.3 - sceT * 0.025, 0.5)).r;
+  float f3 = texture2D(fogC, p * 2.0 + vec2(sceT * 0.012, -sceT * 0.03)).r;
+  float fog = f1 * 0.5 + f2 * 0.35 + f3 * 0.25;
+  vec3 col = vec3(0.0, 0.004, 0.02) + vec3(0.07, 0.17, 0.45) * fog * fog * exp(-dot(p, p) * 2.0) * 1.4;
+  vec2 fq = p / flareScale + 0.5;
+  if (all(greaterThan(fq, vec2(0.0))) && all(lessThan(fq, vec2(1.0)))) col += texture2D(flareMap, fq).rgb * vec3(0.8, 0.9, 1.0) * flareA;
+  gl_FragColor = vec4(col * sceA * master, 1.0);
+}`;
+const SCE_TEXT_FRAG = /* glsl */ `${SCE_U}
+uniform sampler2D map;
+varying vec2 vUv;
+void main() {
+  vec2 uv = vec2(vUv.x, 1.0 - vUv.y);
+  float a = texture2D(map, uv).a, halo = texture2D(map, uv, 3.0).a;
+  gl_FragColor = vec4(vec3(1.0) * a + vec3(0.35, 0.55, 1.0) * halo * 0.6, 1.0) * textA * master;
+}`;
+const SCE_MOTE_VERT = /* glsl */ `${SCE_U}
+attribute float aRnd;
+varying float vA;
+void main() {
+  vec2 p = vec2(position.x + sin(sceT * 0.3 + aRnd * 20.0) * 0.05, mod(position.y + sceT * (0.02 + 0.03 * aRnd) + 1.0, 2.0) - 1.0);
+  gl_PointSize = 3.0 + 9.0 * aRnd * aRnd;
+  vA = (0.25 + 0.75 * fract(aRnd * 7.0)) * (0.6 + 0.4 * sin(sceT * 2.0 + aRnd * 50.0)) * moteA;
+  gl_Position = vec4(p, 0.0, 1.0);
+}`;
+const SCE_MOTE_FRAG = /* glsl */ `${SCE_U}
+uniform sampler2D map;
+varying float vA;
+void main() { gl_FragColor = vec4(vec3(0.6, 0.8, 1.0) * texture2D(map, gl_PointCoord).a * vA * master, 1.0); }`;
+
+function dataTex({ width, height, rgba }, wrap = false, mips = false) {
+  const t = new THREE.DataTexture(rgba, width, height);
+  t.magFilter = THREE.LinearFilter;
+  t.minFilter = mips ? THREE.LinearMipmapLinearFilter : THREE.LinearFilter;
+  t.generateMipmaps = mips;
+  if (wrap) t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  t.needsUpdate = true;
+  return t;
+}
+
 // Logo textures as { tex, half: [x, y] (half size in clip space), sweep }.
 // The disc logo keeps the console's size: its pixels on a 640 x 448 (NTSC) / 512 (PAL) frame.
 function discLogoTexture({ width, height, frameH, pixels }) {
@@ -186,9 +244,9 @@ function logoTexture(img) {
 // ---- sound ---------------------------------------------------------------------------------------
 // Deep swelling pad (detuned saws through an opening low-pass + sub) that peaks into a shimmering
 // bell chime when the logo appears. Returns the time the last sound ends.
-function synth(ctx, out, t0) {
-  const sr = ctx.sampleRate;
-  const irLen = Math.floor(sr * 3);
+// Noise-tail convolution reverb into out; returns its input.
+function reverb(ctx, out, secs, gain) {
+  const sr = ctx.sampleRate, irLen = Math.floor(sr * secs);
   const ir = ctx.createBuffer(2, irLen, sr);
   for (let ch = 0; ch < 2; ch++) {
     const d = ir.getChannelData(ch);
@@ -197,8 +255,14 @@ function synth(ctx, out, t0) {
   const verb = ctx.createConvolver();
   verb.buffer = ir;
   const wet = ctx.createGain();
-  wet.gain.value = 0.45;
+  wet.gain.value = gain;
   verb.connect(wet).connect(out);
+  return verb;
+}
+
+function synth(ctx, out, t0) {
+  const sr = ctx.sampleRate;
+  const verb = reverb(ctx, out, 3, 0.45);
   const dry = ctx.createGain();
   dry.connect(out);
   dry.connect(verb);
@@ -319,6 +383,36 @@ export function startBootIntro({ view, tv, disc, sourceCanvas, frameId, volume =
   scene.add(motes);
   disposables.push(moteGeo);
 
+  // ---- BIOS startup screen (built when the player's BIOS is available) ----
+  const SU = { sceT: { value: 0 }, sceA: { value: 0 }, master: U.master, flareA: { value: 0 }, flareScale: { value: 1 },
+    textA: { value: 0 }, moteA: { value: 0 } };
+  let bios = null, sceObjs = [], logoSounded = false;
+  function buildSce(b) {
+    const T = b.textures;
+    const tex = (x, wrap, mips) => { const t = dataTex(x, wrap, mips); disposables.push(t); return t; };
+    const fog = T.fog.map((f) => tex(f, true));
+    const pick = (i) => fog[i % fog.length];
+    const bgU = { ...SU, fogA: { value: pick(0) }, fogB: { value: pick(2) }, fogC: { value: pick(3) },
+      flareMap: { value: T.flare ? tex(T.flare) : pick(1) } };
+    const bgMesh = quad(mat({ uniforms: bgU, vertexShader: QUAD_VERT, fragmentShader: SCE_FRAG, depthTest: false }), -0.5);
+    // the text keeps its texel size on the 640 x 448 frame, centered
+    const textU = { ...SU, map: { value: tex(T.sce, false, true) }, halfSize: { value: new THREE.Vector2(T.sce.width / 640, T.sce.height / 448) } };
+    const textMesh = quad(mat({ uniforms: textU, vertexShader: LOGO_VERT, fragmentShader: SCE_TEXT_FRAG, depthTest: false,
+      transparent: true, blending: THREE.AdditiveBlending }), 3);
+    const n = 90, pos = new Float32Array(n * 3), rnd = new Float32Array(n);
+    for (let i = 0; i < n; i++) { pos.set([Math.random() * 2 - 1, Math.random() * 2 - 1, 0], i * 3); rnd[i] = Math.random(); }
+    const g = new THREE.BufferGeometry();
+    g.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+    g.setAttribute("aRnd", new THREE.BufferAttribute(rnd, 1));
+    disposables.push(g);
+    const glow = T.glow ? tex(T.glow) : null;
+    const pts = new THREE.Points(g, mat({ uniforms: { ...SU, map: { value: glow } }, vertexShader: SCE_MOTE_VERT, fragmentShader: SCE_MOTE_FRAG,
+      depthTest: false, transparent: true, blending: THREE.AdditiveBlending }));
+    pts.frustumCulled = false; pts.renderOrder = 2;
+    if (glow) scene.add(pts);
+    sceObjs = [bgMesh, textMesh, pts];
+  }
+
   // ---- logo: disc > ps2-logo.png > text ----
   const logoU = { ...U, map: { value: null }, halfSize: { value: new THREE.Vector2() }, sweepAmt: { value: 0 } };
   const logoMesh = quad(mat({ uniforms: logoU, vertexShader: LOGO_VERT, fragmentShader: LOGO_FRAG, depthTest: false, transparent: true }), 10);
@@ -396,6 +490,40 @@ export function startBootIntro({ view, tv, disc, sourceCanvas, frameId, volume =
     console.warn("Boot intro without sound:", e);
     ctx = null;
   }
+  // BIOS sounds (rendered PCM, 48 kHz): dry + reverb send. The SPU2 reverb is approximated.
+  let biosBus = null, verbIn = null, scheduled = [];
+  function playBios(snd, when, bus) {
+    if (!snd) return;
+    verbIn ??= reverb(ctx, master, 2.5, 0.5);
+    for (const [pcm, dest] of [[snd.dry, bus], [snd.wet, verbIn]]) {
+      const buf = ctx.createBuffer(2, pcm[0].length, snd.rate);
+      buf.copyToChannel(pcm[0], 0);
+      buf.copyToChannel(pcm[1], 1);
+      const src = ctx.createBufferSource();
+      src.buffer = buf;
+      src.connect(dest);
+      src.start(when);
+      scheduled.push({ src, when });
+      soundEnd = Math.max(soundEnd, when + buf.duration);
+    }
+  }
+  function startBiosSound() {
+    if (!ctx || finished) return;
+    biosBus = ctx.createGain();
+    biosBus.connect(master);
+    const t0 = ctx.currentTime + 0.05;
+    playBios(bios.sounds.boot, t0, biosBus);
+    playBios(bios.sounds.towers, t0 + SCE_LEN, biosBus);
+  }
+  // skip: the startup / tower sounds fade out (the logo chime still plays)
+  function stopBiosSound() {
+    if (!biosBus) return;
+    const now = ctx.currentTime;
+    biosBus.gain.setTargetAtTime(0, now, 0.08);
+    for (const s of scheduled) if (s.when > now) s.src.stop();
+    soundEnd = now + 0.5;
+  }
+
   async function startSound(audio) {
     if (!ctx || finished) return;
     if (audio) {
@@ -416,11 +544,17 @@ export function startBootIntro({ view, tv, disc, sourceCanvas, frameId, volume =
   }
 
   // The timeline waits (t = 0) until the optional assets are known (at most 0.6 s, under the TV power-on).
-  Promise.race([probeAssets(), new Promise((r) => setTimeout(() => r({}), 600))]).then(({ video: url, audio }) => {
+  Promise.race([Promise.all([probeAssets(), biosIntro()]), new Promise((r) => setTimeout(() => r([{}, null]), 600))]).then(([{ video: url, audio }, b]) => {
     if (finished) return;
     assetsKnown = true;
     t = reduced || skip ? Math.max(t, LOGO_T + LOGO_IN) : 0;
     if (skip) return;
+    if (b && !url && !reduced) {
+      bios = b;
+      buildSce(b);
+      t = -SCE_LEN;
+      return startBiosSound();
+    }
     // Without a user gesture (autoplay policy) the video may only play muted; the sound is lost either way.
     if (url && !reduced) startVideo(url).catch(() => { if (video) { video.muted = true; return video.play(); } })
       .catch((e) => { console.warn("Boot intro: video blocked:", e.message); endVideo(true); });
@@ -455,6 +589,7 @@ export function startBootIntro({ view, tv, disc, sourceCanvas, frameId, volume =
     if (e.type === "keydown" && (e.repeat || document.querySelector("dialog[open]"))) return;
     skip = true;
     if (video) endVideo();
+    stopBiosSound();
     noField = true;
     if (t < logoStart + LOGO_IN) t = logoStart + LOGO_IN;
   };
@@ -507,6 +642,19 @@ export function startBootIntro({ view, tv, disc, sourceCanvas, frameId, volume =
     cam.position.set(x, 7.5 - t * 0.25, z);
     cam.lookAt(x * 0.4, 0, z - 12);
     U.lightPos.value.set(-11 + t * 3.2, 0, z - 9 + Math.sin(t * 0.9) * 3);
+    towers.visible = motes.visible = t > 0 && !noField;
+    if (bios) {
+      const st = t + SCE_LEN, on = t < 0;
+      for (const o of sceObjs) o.visible = on;
+      SU.sceT.value = st;
+      const out = 1 - smooth(SCE_LEN - 1.4, SCE_LEN - 0.2, st);
+      SU.sceA.value = smooth(0.1, 1.8, st) * out;
+      SU.flareA.value = smooth(0.15, 0.45, st) * (1 - smooth(0.9, 2.2, st)) * 1.1;
+      SU.flareScale.value = 0.15 + 1.4 * smooth(0.15, 2.2, st);
+      SU.textA.value = smooth(1.2, 2.8, st) * (1 - smooth(SCE_LEN - 1.9, SCE_LEN - 0.6, st));
+      SU.moteA.value = smooth(0.6, 2.4, st) * out;
+      if (!logoSounded && ctx && logoMesh.visible && t >= logoStart) { logoSounded = true; playBios(bios.sounds.logo, ctx.currentTime, master); }
+    }
 
     // Static on the logo (disc / png logo, reduced motion): the render target keeps the last picture.
     const still = rendered && !fadeStart && !video && t > logoStart + LOGO_IN + 0.1 && !logoU.sweepAmt.value && logoMesh.visible;

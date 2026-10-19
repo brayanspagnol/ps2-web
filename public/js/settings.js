@@ -5,6 +5,8 @@
 // controls are disabled. Gamepad: D-pad/left stick move, ✕/A activates, ◯/B closes, the PS/Home
 // button opens the panel.
 
+import { biosIntro, saveBios, removeBios, describeRomver } from "./ps2-bios.js";
+
 const STORE_KEY = "ps2web.settings";
 
 // PS2::CControllerInfo::BUTTON (Play! source)
@@ -223,6 +225,14 @@ export function createSettings({ tv, getModule, onChange, onClose } = {}) {
       <section aria-labelledby="ps2s-h-adv">
         <h3 id="ps2s-h-adv">Avançado</h3>
         ${row("intro", "Abertura do PS2", "Animação e som de abertura na TV enquanto o jogo carrega. Qualquer tecla, clique ou botão pula.", toggle("intro"))}
+        <div class="ps2s-row">
+          <span>BIOS do seu console<small>Opcional. Com o arquivo da BIOS do <strong>seu próprio PS2</strong> (o dump que você mesmo
+            fez do seu console, como o PCSX2 exige), a abertura toca o som e mostra as imagens originais da BIOS. O arquivo fica só
+            neste navegador e não é enviado a lugar nenhum. Não use BIOS baixada da internet.</small><small data-bios-status></small></span>
+          <span class="ps2s-ctl"><button type="button" class="ps2s-btn" data-act="bios-pick">Escolher…</button>
+            <button type="button" class="ps2s-btn" data-act="bios-remove">Remover</button></span>
+          <input type="file" accept=".bin,.rom" hidden data-bios-file aria-label="Arquivo da BIOS do seu PS2">
+        </div>
         ${row("frameLimit", "Limitar a velocidade", "Desligado, jogos leves rodam acelerados e o som pode falhar. Para testes.", toggle("frameLimit"))}
       </section>
     </div>
@@ -233,6 +243,29 @@ export function createSettings({ tv, getModule, onChange, onClose } = {}) {
   const $$ = (sel) => [...dlg.querySelectorAll(sel)];
   const live = $(".ps2s-live");
   const say = (text) => { live.textContent = text; };
+
+  // ---- BIOS file (boot intro) -------------------------------------------------------------------
+  const biosFile = $("[data-bios-file]");
+  async function renderBios() {
+    const b = await biosIntro();
+    $("[data-bios-status]").textContent = b
+      ? `Carregada: ${describeRomver(b.version)}${b.source === "dev" ? " (da pasta bios/ do servidor local)" : ""}.`
+      : "Nenhuma: a abertura usa uma recriação.";
+    $("[data-act=bios-remove]").hidden = b?.source !== "opfs"; // only what was saved here can be removed
+  }
+  biosFile.addEventListener("change", async () => {
+    const f = biosFile.files[0];
+    biosFile.value = "";
+    if (!f) return;
+    say("Lendo a BIOS…");
+    try {
+      const b = await saveBios(f);
+      say(`BIOS guardada: ${describeRomver(b.version)}. A abertura original toca no próximo jogo.`);
+    } catch (e) {
+      say(`Não deu para usar esse arquivo: ${e.message}.`);
+    }
+    renderBios();
+  });
   let capture = null; // { kind: "key" | "pad", id, btn, timer }
 
   // ---- applying -------------------------------------------------------------------------------
@@ -353,6 +386,11 @@ export function createSettings({ tv, getModule, onChange, onClose } = {}) {
     const el = e.target.closest("button");
     if (!el || el.disabled) return;
     if (el.dataset.act === "close") return close();
+    if (el.dataset.act === "bios-pick") return biosFile.click();
+    if (el.dataset.act === "bios-remove") {
+      removeBios().then(() => { say("BIOS removida deste navegador."); renderBios(); });
+      return;
+    }
     if (el.dataset.act === "reset-controls") {
       stopCapture();
       s.keys = {};
@@ -442,6 +480,7 @@ export function createSettings({ tv, getModule, onChange, onClose } = {}) {
     if (dlg.open) return;
     render();
     renderPads();
+    renderBios();
     say("");
     getModule?.()?.setGamepadEnabled?.(false);
     dlg.showModal();
