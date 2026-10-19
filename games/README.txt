@@ -3,7 +3,7 @@ Pasta de jogos do PS2 na Sala
 
 Coloque aqui as cópias (dumps) dos SEUS discos: .iso, .cso, .chd, .isz, .bin
 ou programas .elf. O serve.py publica esta pasta em /games/ e o site mostra
-cada arquivo na estante como "Disponível", pronto para jogar, sem escolher
+cada arquivo na estante, pronto para jogar, sem escolher
 arquivo nem copiar nada para o navegador.
 
 - Discos .iso/.bin são reconhecidos pelo serial (SYSTEM.CNF) e ganham a capa

@@ -13,7 +13,7 @@ fix A/B and state hashes NOT measured yet. Base: web-perf cd7a2a58.
 - Profiling builds: `SLOWCOMPILE` lines in the profiler log (`bench.log`) for block compiles > 10 ms
   (category 4CC, range, words, wasm bytes, Jitter ms, wasm ms, cacheable). Zone switching fixed (the VU1 thread
   used to switch the VM thread's zone).
-- Scratchpad tools (`/tmp/claude-1000/-home-brayan-spagnol/d44e6a54-b666-4287-bcd6-59e04ff885ad/scratchpad/tools/`):
+- Scratchpad tools (session scratchpad `tools/`, not committed):
   `drun.sh <emu> <play|car|ffx|gow-fight> <secs> <tag> [extra query] [--walk]` (bench-run lock, own tab,
   dips.py: timeline + per-thread schedstat/CPU id every 50 ms + per-CPU busy/MHz; `--walk` holds T, taps Z,
   turns with H), `dipan.py <run.json> [--top=N]` (vbl/s percentiles, slow vblanks = > 1.5x median of *work*

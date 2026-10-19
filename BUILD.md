@@ -18,14 +18,14 @@ cmake and ninja come from the system (/usr/bin).
 ## Source
 
 ```sh
-cd ~/Projetos/ps2-web
+cd ps2-web   # this repository
 git clone --recursive -b web-perf https://github.com/brayanspagnol/Play- play-src
 ```
 
 ## Build (release, -O3 + wasm SIMD)
 
 ```sh
-cd ~/Projetos/ps2-web/play-src
+cd play-src
 source ~/.local/share/emsdk/emsdk_env.sh
 F="-msimd128"
 emcmake cmake -S . -B build_cmake/build/wasm-simd -G "Ninja Multi-Config" \

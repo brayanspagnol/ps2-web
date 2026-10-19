@@ -1,0 +1,20 @@
+# Cloudflare Pages response headers (https://developers.cloudflare.com/pages/configuration/headers/).
+# The emulator uses threads (SharedArrayBuffer), which browsers only allow on a cross-origin
+# isolated page: COOP + COEP on every response. Everything the site loads is same-origin.
+/*
+  Cross-Origin-Opener-Policy: same-origin
+  Cross-Origin-Embedder-Policy: require-corp
+  Cross-Origin-Resource-Policy: same-origin
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: no-referrer
+
+# File names carry no content hash, so HTML, scripts and the emulator keep Pages' default
+# (revalidate on every load, cheap with ETags). Vendored three.js and box art rarely change.
+/emu/*.wasm
+  Content-Type: application/wasm
+
+/vendor/*
+  Cache-Control: public, max-age=604800
+
+/covers/*
+  Cache-Control: public, max-age=604800

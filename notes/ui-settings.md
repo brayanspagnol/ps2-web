@@ -1,6 +1,6 @@
 # Settings panel (branch `ui-settings`)
 
-Site worktree `~/Projetos/ps2-web-ui` (branch `ui-settings`), emulator worktree `~/Projetos/ps2-web/play-ui`
+Site worktree `../ps2-web-ui` (branch `ui-settings`), emulator worktree `play-ui`
 (Play! fork, branch `ui-settings`, based on `web-perf` cd7a2a58 = the build in `public/emu` before this work).
 `public/emu/Play.{js,wasm}` in this branch is a TEST build of play-ui `ui-settings` f6a9dee5 (= web-perf 956de846
 + the settings API, release, `-msimd128`), committed so the branch can be reviewed as is; the main agent decides
