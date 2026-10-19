@@ -1,7 +1,8 @@
 # Firefox out of memory with the JIT (2026-10-19)
 
 Branch `firefox-mem` (Play 53b18fe3, CodeGen cc7f1eb), worktree `play-firefox/`, both pushed to `fork`.
-Not merged into web-perf. Build deployed only to `public/emu-firefox/` (bench `&emu=firefox`).
+**Shipped 2026-10-19:** fast-forwarded into web-perf (Play 53b18fe3, CodeGen web-perf cc7f1eb), both pushed to `fork`;
+build live in `public/emu/` (Brave hashes car/mtvu-ffx/gow-fight identical, car.zip timing unchanged). `public/emu-firefox/` removed.
 
 ## Root cause
 - Firefox (SpiderMonkey) allocates executable memory for each wasm module in 64 KiB chunks and caps a
