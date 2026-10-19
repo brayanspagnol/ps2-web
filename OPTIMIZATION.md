@@ -189,6 +189,15 @@ Release build, car.zip (police car cutscene): cold run 29 s to stable and 13 sam
 3 s). With other load on the machine (a second emulator tab) a cold run took ~56-73 s to stabilise and
 a warm one 6 s. Cache size on disk: 25 MB after one play.zip session, 34 MB after car + play.
 
+## God of War: wait loops (see notes/gow-perf.md)
+
+GoW (SCUS_973.99) polls the vsync counter and an interrupt-cleared flag with 2000/20000-iteration delay
+loops between polls (~77% of EE time in combat). `GameConfig.xml` patches the delay counts to 1 and marks
+the poll blocks as idle loops; patches are re-applied after a state load. The MTVU front VIF1
+`SkipUnpack` also skips contiguous (cl == wl) UNPACK vectors in one step. Release, MTVU on, no limiter,
+wall ms/vbl over vblanks 100-700 (2 ABAB rounds): gow-fight 28.4 -> 18.9 (-33%, 34 -> 53 vbl/s),
+gow-title 12.1 -> 8.5 (-30%); car.zip 39.4 -> 38.6 and mtvu-ffx 26.1 -> 24.5 (noise, hashes identical).
+
 ## Remaining bottlenecks / next steps
 
 1. EE JIT code quality and dispatch: every block returns to the C++ dispatcher (no block linking on
