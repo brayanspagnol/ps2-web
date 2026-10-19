@@ -198,6 +198,15 @@ the poll blocks as idle loops; patches are re-applied after a state load. The MT
 wall ms/vbl over vblanks 100-700 (2 ABAB rounds): gow-fight 28.4 -> 18.9 (-33%, 34 -> 53 vbl/s),
 gow-title 12.1 -> 8.5 (-30%); car.zip 39.4 -> 38.6 and mtvu-ffx 26.1 -> 24.5 (noise, hashes identical).
 
+## Tier-2 EE regions (not published, see notes/tier2-m2b.md)
+
+Hot EE entries compiled as regions (up to 16 tier-1 blocks of one 4 KB page in one structured wasm function,
+Play `tier2` fadcfea1, `public/emu-t2`, `&t2=16`). State hashes identical on play/car/gow-fight/mtvu-ffx, GTA SA
+cold boot reaches the intro, but slower: wall ms/vbl over vblanks 100-600 (VU1 on VM thread, no limiter, 2 ABAB
+rounds) play.zip 40.3 -> 46.5 (+15%), car.zip 46.3 -> 57.8 (+25%), gow-fight 58.8 -> 76.6 (+30%), mtvu-ffx
+33.9 -> 35.7 (noise); car.zip steady state (1100-1600) 34.0 -> 35.4. Likely cause: region churn (regions span data
+between their parts, data writes drop them, hot entries rebuild them; ~500 regions/s at GTA cold boot). Off by default.
+
 ## Remaining bottlenecks / next steps
 
 1. EE JIT code quality and dispatch: every block returns to the C++ dispatcher (no block linking on
