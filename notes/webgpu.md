@@ -53,11 +53,21 @@ the Vulkan shader).
   by each primitive; a batch is one dispatch. Batches end at FRAME/ZBUF changes, transfers, CLUT loads,
   flips, and when a primitive's texture range overlaps the batch's frame/depth memory (the dispatch
   boundary gives the same "previous draws are visible" guarantee as the Vulkan barrier between draws).
-  Sprites sampling their own frame buffer use the Vulkan backend's memory-copy scheme (copy the texture
-  range first; start a new copy when a sprite overlaps the area written since).
-- Workgroup = 16x16 pixel tile over the batch's bounding box. Binning on the GPU: the workgroup tests 256
-  primitive bounding boxes at a time, keeps an ordered bitmask, then every invocation shades the
-  overlapping primitives in order.
+  Primitives whose texture overlaps the frame/depth area they write use the Vulkan backend's memory-copy
+  scheme (copy the texture range first; sprites start a new copy when they overlap the area written since);
+  a batch also ends when its write range grows over a texture one of its primitives read.
+- Workgroup = 8x8 pixel tile (16x16 for batches whose primitives average >= 256 pixels: full screen
+  effects), invocations mapped to 4x4 pixel blocks (one SIMD16 thread each on Intel). Binning on the CPU
+  (`FlushBatch`): per tile, the primitives whose bounding box touches it, minus triangles with all the
+  tile's sample points outside one edge; only non-empty tiles get a workgroup, longest lists first. The
+  workgroup takes the list 64 (256) primitives at a time: each invocation computes one primitive's coverage
+  mask of the tile, then every invocation shades the primitives covering its pixel, in order.
+- Per fragment: depth test, DATE and scan mask first (a fragment failing them is dropped whatever the alpha
+  test says), then color/texture interpolation, texturing, TFX, fog, alpha test, blending. Frame/depth
+  values stay in registers for the whole batch (one read and one write per pixel per batch). Sub-word
+  writes (16/8/4-bit) are one atomic XOR with the read value (each bit has one writer per dispatch).
+- Draw pipelines are specialized (override constants) per batch for the features it uses and for its
+  texture formats (32/16-bit, T8, T4, 16/32-bit CLUT); unused paths compile out (fewer registers/spills).
 - Coverage/interpolation follow what the Vulkan path gets from the hardware: pixel (x, y) is sampled at
   GS coordinate (x, y) (vertex + 0.5 in Vulkan), top-left fill rule on 12.4 fixed-point edges, sprites
   cover [x1, x2) x [y1, y2), attributes interpolated linearly in screen space (STQ divided per pixel).
@@ -100,28 +110,40 @@ into a render pass on the GS thread's OffscreenCanvas `webgpu` context, then the
 - `Source/ui_js/GSH_WebGPU.{h,cpp}`: CGSH_WebGPU (GS thread). Register/primitive handling ported from
   GSH_Vulkan.cpp; records a command list (`OP_*`), an upload arena, primitives (`PRIM_WORDS` = 28 words) and
   state records (`STATE_WORDS` = 40, layout in `STATE_*`). Batches = runs of primitives with the same
-  frame/depth buffer; binned per 8x8 tile in `FlushBatch`. Host transfers are queued (`m_pendingXfers`) and
-  dispatched together; CLUTs use a 1024-slot ring; CLUTs that come from a recent small host transfer are built
-  on the CPU (`LoadClutFromTransfer`).
-- `Source/ui_js/GSH_WebGPU.js` (`--pre-js`): `GsWgpu` (device, buffers, pipelines, `execute()`), all WGSL.
-  `drawConfig` = shader tuning knobs; `drawFeatures` = override constants of the specialized draw pipelines.
+  frame/depth buffer; binned per tile in `FlushBatch`. Command lists are submitted at flips and every
+  `SUBMIT_PRIMS` primitives. Host transfers are queued (`m_pendingXfers`) and dispatched together; CLUTs use a
+  1024-slot ring (32-bit CLUTs stored as whole colors); CLUTs whose memory the CPU copy holds (small host
+  transfers, `m_cpuValid`) are built on the CPU (`LoadClutFromCpu`).
+- `Source/ui_js/GSH_WebGPU.js` (`--pre-js`): `GsWgpu` (device, buffers, pipelines, `execute()`), all WGSL;
+  two compute modules (8x8 and 16x16 draw tiles). `drawFeatures` = override constants of the specialized
+  draw pipelines.
 - `Source/ui_js/Main.cpp`: `Module.gsBackend = "webgpu"` before `initVm` picks the backend;
-  `Module.setGsDebug(1)` logs stats from the GS worker every 2 s, `setGsDebug(2|1)` captures a frame
-  (`Module.onGsCapture(object)` on the page).
+  `Module.setGsDebug(1)` logs stats from the GS worker every 2 s (frames/s, submits, batches, prims, upload,
+  JS time and GPU time per submit), `setGsDebug(2|1)` captures a frame (`Module.onGsCapture(object)` on the
+  page), `setGsDebug(4|1)` skips draws (CPU-bound speed of the rest).
 - Site: `public/js/emulator.js` `?gs=webgpu`.
 
 ## Tools (scratchpad `wgpu/`, session-specific; recreate from here if lost)
-- `wrun.mjs '<bench query>' <secs> [--shot=prefix --shotAt=a,b] [--pre=expr] [--captureAt=s --captureDir=dir]`:
-  own tab on the test Brave, worker console capture, vbl/s samples, abort rules; `--captureAt` saves a frame
-  capture (memory/copy/CLUT/swizzle buffers + command lists) into `public/emu-webgpu-replay/<name>/`.
-- `public/emu-webgpu-replay/replay.html?cap=<name>&iter=N[&tile=8&primCache=0&pixelCache=1&exit=k&profile=1]`
-  (gitignored dir): replays the capture with the current `GSH_WebGPU.js` copied next to it; prints wall
-  ms per frame, a hash of GS memory after the frame (must not change with optimizations), per-dispatch GPU
-  times with `profile=1`, `exit=k` stops shading at stage k (profiling). `replay.sh <name> [iter] [shot] [query]`.
-- `cmp.sh <emu> <play|car|ffx|gow-fight> <secs> <tag> [shotAt]`: WebGPU run then WebGL2 run of the same state.
+- `wrun.mjs '<bench query or url>' <secs> [--shot=prefix --shotAt=a,b] [--debug | --gsdebug=N]
+  [--captureAt=s --captureDir=dir] [--done=expr]`: own tab on the test Brave ([::1]:9222), worker console
+  capture (GSH_WebGPU stats lines), vbl/s samples, abort rules, `time=` results; `--captureAt` saves a frame
+  capture (memory/copy/CLUT/swizzle buffers + every command list of the frame) into
+  `public/emu-webgpu-replay/<name>/` (gitignored). `t1.sh <emu> <state> <label> [--gl] [wrun args]`: one
+  `nolimit=1&time=100,700` run (ms per vblank over vblanks 100-700).
+- Offline replays without the browser, on the same Dawn + Mesa/ANV stack (npm `webgpu` 0.6.1 = Dawn node
+  bindings, in scratchpad `dawn/`): `nreplay.mjs <capdir> [src=GSH_WebGPU.js] [profile=1 all=1]` prints wall ms,
+  per-dispatch GPU times and the GS memory hash; `nab.mjs <capdir> A.js B.js [n]` interleaves A and B runs
+  in one process and prints the median per-pair ratio B/A plus both hashes (equal hash = same output). Run
+  them under `locks/bench-run` (the GPU is shared). Captures only replay with a `GSH_WebGPU.js` whose
+  command/upload layout matches the build that made them.
+- `isa.sh <src.js> [features hex...]` (`nisa.mjs`): compiles draw pipelines under
+  `MESA_SHADER_CACHE_DISABLE=true INTEL_DEBUG=cs` and prints Intel SIMD width, instruction count, spills.
+- Measuring: the iGPU clock is managed by SLPC/PL1 and varies 300-1400 MHz with the load of the machine
+  (`/sys/class/drm/card1/gt/gt0/rps_act_freq_mhz`, `throttle_reason_*`): absolute times move 2x between runs.
+  Decide with interleaved A/B ratios (`nab.mjs`) and alternate WebGPU/WebGL2 game runs.
 - Note: every new Play.wasm invalidates the JIT block cache, so the first in-game run of a build compiles a
-  lot (jit=600+); compare builds on a second run. The GPU is shared (other agents' tabs): use the replay
-  minimum and repeat.
+  lot (jit=600+); compare builds on a second run. The `--pre-js` file is not a build dependency: delete
+  `Release/Play.js` to relink after editing only `GSH_WebGPU.js`.
 
 ## Log
 - 2026-10-16 M1: transfers/present working (emu-webgpu1), black frames. M2: draws (emu-webgpu2): GTA play.zip
@@ -134,3 +156,36 @@ into a render pass on the GS thread's OffscreenCanvas `webgpu` context, then the
   uncovered primitives (GoW frame 91 -> 52 ms). Workgroup-memory copies of primitives were slower (dropped).
   GTA streams ~500 small texture/CLUT uploads per frame: transfers are now merged into one dispatch and
   hoisted over the open batch when it doesn't touch their memory; CLUTs from those uploads are built on the CPU.
+- 2026-10-19 M4 performance (commits 05618372..771c87dd on `webgpu`). What was slow, measured with offline
+  replays (Dawn node + ISA dumps) and in-game `nolimit` runs:
+  - GoW was GPU-bound: with draws skipped (`setGsDebug(5)`) the emulator ran 20.6 ms/vblank, i.e. faster than
+    WebGL2; with draws 32 ms. GPU 35-60 ms per GoW frame, only ~60% busy, and the Intel GPU clock (SLPC,
+    shared PL1 power with the CPU) sat at 300-700 MHz most of the time.
+  - Draw shader: the unrolled bilinear CLUT path spilled (37 spills / 132 fills in the GoW variant); scalar
+    `prims`/`states` loads were bounds-checked one by one and not merged (137 sends). Atomic loads cost nothing
+    extra on ANV (same ISA as plain loads); the swizzle table lookup is cheaper than computing the swizzle;
+    a bilinear tap loop (no spills) was 1.5x slower (serialized latency); workgroup-memory copies of primitives
+    and a "dense fragments" variant (fragments of a chunk computed one per invocation, then resolved per pixel)
+    were slower too.
+  - 44% of the tile entries of a GoW frame covered no pixel (bounding box only); a third of the GPU time went
+    to ~40 small full-screen sprite passes (shadows) whose cost is the fixed per-workgroup chain of loads;
+    16x16 tiles for such batches did not help in game (reverted).
+  - Sub-word writes were two atomics; FFX streams ~1M PSMT8/PSMT4 texels per frame through per-texel atomics.
+  - GTA SA had a real race (texture read while another tile writes it): replays gave different results.
+  Fixes (each checked on replays: same GS memory hash, interleaved A/B ratio): vec4 loads of prims/states
+  (~0.85x), depth test + DATE + scan mask before texturing (0.84x), CPU culling of empty tile entries,
+  non-empty tiles only and longest first, single-atomic XOR sub-word writes (GoW 0.92x, FFX 0.83x),
+  pipelines specialized by texture format (0.93x), whole-word PSMT8/PSMT4 transfers (FFX frame 63 -> 38 ms
+  unlocked), 32-bit CLUT entries in one word, lazy frame buffer reads, mid-frame submits. Race fixes: split the
+  batch when its write range grows over a texture it read; memory copy for any primitive whose texture
+  overlaps the area it writes.
+  In game (`nolimit=1&time=100,700`, ms per vblank, WebGPU vs WebGL2 of the same build, two alternated rounds;
+  machine shared with other agents, +-15% between rounds): before (HEAD 2adc2ef3 + previous session's work):
+  GoW gow-fight 29.4 vs 22.9, car 41.3 vs 59.6. After (6698b549): GoW 27.9 / 25.9 vs 27.7 / 21.5 (~9% slower),
+  car 37.8 / 34.6 vs 40.8 / 34.7 (~4% faster), FFX mtvu-ffx 32.7 / 25.2 vs 31.7 / 24.6 (parity). GoW GPU time
+  per frame ~40 -> ~21 ms.
+  771c87dd (race fixes) on a quieter machine: GoW 27.0 / 24.8 vs WebGL2 19.7, so GoW is still 10-30% behind
+  (GPU-bound on this iGPU); next candidates: the per-workgroup fixed cost of the many small sprite passes
+  and texture sampling (~25% of a GoW frame).
+  M3: FFX mtvu-ffx renders like WebGL2 (credits scene, field + characters + text); GoW gow-fight shows the
+  shadows and correct colors (WebGL2 shows shadow artifacts there); gow-title and car match WebGL2.
