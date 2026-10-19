@@ -6,6 +6,7 @@ import fs from "node:fs";
 import path from "node:path";
 import assert from "node:assert/strict";
 import { readRomdir, unlz, extractIntro } from "../public/js/ps2-bios.js";
+import { unpackOsdsys, findOpeningData } from "../public/js/ps2-osd.js";
 
 // LZ: 3 literals "abc", then a copy of 6 bytes from 3 back -> "abcabcabc" (flag word: bits 0,0,0,1, k = 0).
 const lz = Uint8Array.from([9, 0, 0, 0, 0x10, 0, 0, 0, 0x61, 0x62, 0x63, 0xc0, 0x02]); // copy: len field 3 (6 bytes), distance 3
@@ -29,6 +30,18 @@ for (const name of fs.existsSync(dir) ? fs.readdirSync(dir) : []) {
   for (const ch of [...boot.dry, ...boot.wet]) for (const v of ch) { peak = Math.max(peak, Math.abs(v)); energy += v * v; }
   assert.ok(peak > 0.01 && peak < 4, `startup sound level out of range (peak ${peak})`);
   assert.ok(energy > 100, "startup sound is (nearly) silent");
+  // the opening's tables (OSDSYS): located by shape, only counts are printed
+  const osd = unpackOsdsys(readRomdir(new Uint8Array(fs.readFileSync(path.join(dir, name)))).get("OSDSYS"));
+  assert.ok(osd, "OSDSYS payload not found");
+  const op = findOpeningData(osd);
+  assert.equal(op.cameraKeys.length, 7);
+  assert.equal(op.grid.cells.length, 126);
+  assert.equal(op.history.length, 21);
+  assert.equal(op.faces.length, 6);
+  assert.equal(op.lights.colors.length, 4);
+  assert.equal(op.lights.cubes.length, 5);
+  assert.equal(op.fog.length, 6);
+  console.log(`  opening data: OSDSYS ${osd.length} bytes, all tables found`);
   if (!out) continue;
   fs.mkdirSync(out, { recursive: true });
   for (const [k, s] of Object.entries(r.sounds)) if (s) fs.writeFileSync(path.join(out, `${k}.wav`), wav(s));

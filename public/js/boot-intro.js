@@ -388,7 +388,7 @@ export function startBootIntro({ view, tv, disc, sourceCanvas, frameId, volume =
   // ---- BIOS startup screen (built when the player's BIOS is available) ----
   const SU = { sceT: { value: 0 }, sceA: { value: 0 }, master: U.master, flareA: { value: 0 }, flareScale: { value: 1 },
     textA: { value: 0 }, moteA: { value: 0 } };
-  let bios = null, sceObjs = [], logoSounded = false;
+  let bios = null, sceObjs = [], logoSounded = false, chime = null; // chime: BIOS logo sound (also with the video)
   function buildSce(b) {
     const T = b.textures;
     const tex = (x, wrap, mips) => { const t = dataTex(x, wrap, mips); disposables.push(t); return t; };
@@ -556,6 +556,7 @@ export function startBootIntro({ view, tv, disc, sourceCanvas, frameId, volume =
     assetsKnown = true;
     t = reduced || skip ? Math.max(t, LOGO_T + LOGO_IN) : 0;
     if (skip) return;
+    chime = b?.sounds.logo ?? null;
     if (b && !url && !reduced) {
       bios = b;
       buildSce(b);
@@ -660,8 +661,9 @@ export function startBootIntro({ view, tv, disc, sourceCanvas, frameId, volume =
       SU.flareScale.value = 0.15 + 1.4 * smooth(0.15, 2.2, st);
       SU.textA.value = smooth(1.2, 2.8, st) * (1 - smooth(SCE_LEN - 1.9, SCE_LEN - 0.6, st));
       SU.moteA.value = smooth(0.6, 2.4, st) * out;
-      if (!logoSounded && ctx && logoMesh.visible && t >= logoStart) { logoSounded = true; playBios(bios.sounds.logo, ctx.currentTime, master); }
     }
+
+    if (chime && !logoSounded && ctx && logoMesh.visible && t >= logoStart) { logoSounded = true; playBios(chime, ctx.currentTime, master); }
 
     // Static on the logo (disc / png logo, reduced motion): the render target keeps the last picture.
     const still = rendered && !fadeStart && !video && t > logoStart + LOGO_IN + 0.1 && !logoU.sweepAmt.value && logoMesh.visible;
