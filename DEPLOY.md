@@ -50,3 +50,6 @@ browser console, `crossOriginIsolated` must be `true`.
 ## Custom domain (optional)
 
 Pages project > **Custom domains** > **Set up a custom domain**. The headers in `_headers` apply there too.
+
+The development pages (`bench.html`, `test.html`, `demo-*.html`) stay in the repo but answer 404 on
+the public site through `public/_redirects`.

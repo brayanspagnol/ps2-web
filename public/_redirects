@@ -1,0 +1,11 @@
+# Development pages stay in the repo but are not served on the public site.
+/bench.html /404.html 404
+/test.html /404.html 404
+/demo-console.html /404.html 404
+/demo-crt.html /404.html 404
+/demo-library.html /404.html 404
+/bench /404.html 404
+/test /404.html 404
+/demo-console /404.html 404
+/demo-crt /404.html 404
+/demo-library /404.html 404
