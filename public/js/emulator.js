@@ -48,6 +48,12 @@ export async function init() {
     mainScriptUrlOrBlob: EMU_DIR + "Play.js",
   });
   mod.FS.mkdir("/work");
+  // Remember what the page asks for, so a fast start (see boot) can override and then restore it.
+  for (const k of ["setFrameLimit", "setAudioVolume"]) {
+    const f = mod[k];
+    if (f) mod[k] = (v) => { wanted[k] = v; if (!fast) f(v); };
+    if (f) direct[k] = f;
+  }
   mod.discImageDevice = new DiscImageDevice(mod);
   // The GS thread renders on its own OffscreenCanvas and sends every frame here as an ImageBitmap.
   // Builds before that create a WebGL context on #outputCanvas in initVm (so "bitmaprenderer" is null)
@@ -57,6 +63,7 @@ export async function init() {
   const gsReady = new Promise((r) => (firstFrame = r));
   const canvas = document.getElementById("outputCanvas");
   mod.onGsFrame = (bitmap) => {
+    if (fast && !isBlack(bitmap)) endFastStart(true);
     if (canvas.width !== bitmap.width || canvas.height !== bitmap.height) {
       canvas.width = bitmap.width;
       canvas.height = bitmap.height;
@@ -71,10 +78,57 @@ export async function init() {
   return mod;
 }
 
+// ---- Fast start ------------------------------------------------------------------------------
+// Most games show a black screen for seconds after boot while they load. Until the first frame with
+// something on it, boot() runs the emulator without the frame limiter (emulated timing is the same,
+// it just isn't held to wall-clock speed) and with the sound muted, then restores both.
+const wanted = { setFrameLimit: true, setAudioVolume: 1 }; // last values the page set
+const direct = {};
+const FAST_START_MAX_MS = 30000;
+const FAST_START = new URLSearchParams(location.search).get("faststart") !== "0"; // ?faststart=0 turns it off (A/B)
+let fast = false, fastTimer = 0, quietUntil = null, lastProbe = 0;
+const probe = typeof OffscreenCanvas === "function" ? new OffscreenCanvas(16, 12).getContext("2d", { willReadFrequently: true }) : null;
+
+function isBlack(bitmap) {
+  if (!probe) return false;
+  const now = performance.now();
+  if (now - lastProbe < 100) return true; // a readback per frame is not free; 10 checks/s are plenty
+  lastProbe = now;
+  probe.drawImage(bitmap, 0, 0, 16, 12);
+  const px = probe.getImageData(0, 0, 16, 12).data;
+  let lit = 0;
+  for (let i = 0; i < px.length; i += 4) if (px[i] + px[i + 1] + px[i + 2] > 48) lit++;
+  return lit < 4;
+}
+
+function startFastStart(quiet) {
+  if (!direct.setFrameLimit || !probe) return;
+  fast = true;
+  quietUntil = quiet;
+  direct.setFrameLimit(false);
+  direct.setAudioVolume?.(0);
+  clearTimeout(fastTimer);
+  fastTimer = setTimeout(() => endFastStart(true), FAST_START_MAX_MS); // a game that stays black (or an old build without onGsFrame)
+}
+
+// waitQuiet: keep the sound muted until the boot's quietUntil settles (not when booting again / pausing).
+function endFastStart(waitQuiet = false) {
+  if (!fast) return;
+  fast = false;
+  clearTimeout(fastTimer);
+  direct.setFrameLimit(wanted.setFrameLimit);
+  const unmute = () => { if (!fast) direct.setAudioVolume?.(wanted.setAudioVolume); };
+  if (waitQuiet && quietUntil) quietUntil.then(unmute, unmute); else unmute();
+  quietUntil = null;
+}
+
 // Boots a user-supplied disc image or ELF: a File, or a library RemoteFile
 // (same name/size/slice().arrayBuffer()/arrayBuffer() surface, streamed over HTTP).
 // options.blockCache = false disables the persistent JIT block cache for this boot.
-export async function boot(file, { blockCache = true } = {}) {
+// options.fastStart = false boots at normal speed with sound (see "Fast start" above).
+// options.quietUntil: a promise; the sound stays muted until it settles (e.g. while the page still
+// animates before showing the game).
+export async function boot(file, { blockCache = true, fastStart = true, quietUntil = null } = {}) {
   if (!mod) throw new Error("Chame init() antes de boot().");
   const dot = file.name.lastIndexOf(".");
   const ext = dot === -1 ? "" : file.name.slice(dot).toLowerCase();
@@ -83,6 +137,8 @@ export async function boot(file, { blockCache = true } = {}) {
   }
   gameKey = `${file.name}-${file.size}`;
   await setBlockCache(blockCache ? gameKey : null);
+  endFastStart();
+  if (fastStart && FAST_START) startFastStart(quietUntil);
   if (ext === ".elf") {
     const data = new Uint8Array(await file.arrayBuffer());
     mod.FS.writeFile(file.name, data);
@@ -102,6 +158,7 @@ export async function boot(file, { blockCache = true } = {}) {
 
 // Stops emulation until the next boot() (emulation threads idle, audio suspended). Older builds keep running.
 export function pause() {
+  endFastStart();
   mod?.pauseVm?.();
 }
 

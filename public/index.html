@@ -93,15 +93,19 @@
       library.hide();
       $("library").hidden = true;
       msg("");
+      // Boot while the disc and TV animations play (sound held until the game is on the TV).
+      let shown;
+      const booted = emuReady.then(() => emu.boot(file, { quietUntil: new Promise((r) => (shown = r)) }));
+      booted.catch(() => {}); // handled below
       await view.insertDisc({ id: game.id, title: game.title, color: game.palette?.accent ?? "#5aa9ff", labelCanvas: renderDiscLabel(game) });
       tv.setSignal(false);
       if (settings.settings.intro) intro = startBootIntro({ view, tv, disc: file, sourceCanvas: $("outputCanvas"), frameId: emu.frameId,
         volume: () => (settings.settings.muted ? 0 : settings.settings.volume) });
       await Promise.all([tv.setPower(true), view.focusTv()]);
-      await emuReady;
-      await emu.boot(file);
+      await booted;
       await intro?.done;
       tv.setSignal(true);
+      shown();
       showHud();
     } catch (e) {
       intro?.cancel();
