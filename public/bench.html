@@ -72,12 +72,22 @@
     if (q.get("vujit") && mod.setVuJitOptions) { const [p, d, n] = q.get("vujit").split(",").map(Number); mod.setVuJitOptions(!!p, !!d, !!n); }
     // &eebatch=N: EE blocks per batch wasm module (0 = one module per block; builds that export setEeBatchSize)
     if (q.get("eebatch") && mod.setEeBatchSize) mod.setEeBatchSize(Number(q.get("eebatch")));
+    // &eeregion=N: EE regions, blocks within N bytes compiled into one function (0 = off; builds that export setEeRegionSpan)
+    if (q.get("eeregion") && mod.setEeRegionSpan) mod.setEeRegionSpan(Number(q.get("eeregion")));
+    // &brsel=0|1: MIPS branches and block epilogues with selects instead of if/else (builds that export setJitBranchSelect)
+    if (q.get("brsel") && mod.setJitBranchSelect) mod.setJitBranchSelect(q.get("brsel") === "1");
     // &pageacc=0: guest loads/stores with the older if/else Jitter sequence; a number = mask of access kinds (debug)
     if (q.get("pageacc") && mod.setJitPageAccess) mod.setJitPageAccess(Number(q.get("pageacc")) >>> 0);
     // &eedump=addr,addr,...: dump wasm + disassembly of these EE blocks when they compile (mod.eeDumpResult())
     if (q.get("eedump") && mod.eeDumpRequest) mod.eeDumpRequest(q.get("eedump"));
     // &vusb=0|1: VU superblocks (builds that export setVuSuperBlocks)
     if (q.get("vusb") && mod.setVuSuperBlocks) mod.setVuSuperBlocks(q.get("vusb") === "1");
+    // &t2=N: tier-2 EE regions of up to N blocks (0 = off; builds that export setEeRegionParts)
+    if (q.get("t2") && mod.setEeRegionParts) mod.setEeRegionParts(Number(q.get("t2")));
+    // &t2hot=N: an EE entry gets a region after N samples of one dispatch in 64 (builds that export setEeRegionHotSamples)
+    // &t2promo=1: EE regions with context promotion (builds that export setEeRegionPromotion)
+    if (q.get("t2promo") && mod.setEeRegionPromotion) mod.setEeRegionPromotion(q.get("t2promo") === "1");
+    if (q.get("t2hot") && mod.setEeRegionHotSamples) mod.setEeRegionHotSamples(Number(q.get("t2hot")));
     if (q.get("blockcache") === "clear") await emu.clearBlockCache(`${game}-${size}`);
     await emu.boot({ name: game, size, url, slice: () => { throw new Error("url only"); } }, { blockCache: q.get("blockcache") !== "0" });
     // &vu1thread=0: VU1 on the VM thread; &hash=N: hashes of EE/IOP state+RAM at the first N vblanks after the state load (mod.eeHashResult())
