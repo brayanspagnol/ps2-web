@@ -50,16 +50,18 @@ export const DEFAULTS = {
   resFactor: 2, bilinear: false, widescreen: false, fill: false,
   crt: true, scanlines: 1, curvature: 1, bloom: 1,
   volume: 1, muted: false,
-  frameLimit: true, intro: true,
+  frameLimit: true, intro: true, perfAuto: true,
   keys: {}, pad: {}, // control id -> key code / gamepad button, only where it differs from the default
 };
+// Settings the performance profile may choose (perf.js pickDefaults) while the player has not set them.
+const AUTO_KEYS = ["resFactor", "crt"];
 const RANGES = { resFactor: [1, 4], scanlines: [0, 2], curvature: [0, 2], bloom: [0, 2], volume: [0, 1] };
 const GROUP = { resFactor: "gs", bilinear: "gs", widescreen: "gs", fill: "gs", crt: "crt", scanlines: "crt",
-  curvature: "crt", bloom: "crt", volume: "audio", muted: "audio", frameLimit: "limit", intro: "intro" };
+  curvature: "crt", bloom: "crt", volume: "audio", muted: "audio", frameLimit: "limit", intro: "intro", perfAuto: "perf" };
 
 // localStorage is untrusted input (old versions, edits by hand): keep only valid values.
 function sanitize(raw) {
-  const s = { ...DEFAULTS, keys: {}, pad: {} };
+  const s = { ...DEFAULTS, keys: {}, pad: {}, touched: {} };
   if (!raw || typeof raw !== "object") return s;
   for (const [k, def] of Object.entries(DEFAULTS)) {
     const v = raw[k];
@@ -67,6 +69,11 @@ function sanitize(raw) {
     else if (typeof def === "number" && Number.isFinite(v)) s[k] = Math.min(RANGES[k][1], Math.max(RANGES[k][0], v));
   }
   s.resFactor = Math.round(s.resFactor);
+  // Settings the player changed (auto defaults leave them alone). Saved before this existed: what differs from
+  // the defaults.
+  for (const k of AUTO_KEYS) {
+    if (raw.touched ? raw.touched[k] === true : s[k] !== DEFAULTS[k]) s.touched[k] = true;
+  }
   for (const c of CONTROLS) {
     const k = raw.keys?.[c.id], p = raw.pad?.[c.id];
     if (typeof k === "string" && /^[A-Za-z0-9]{1,32}$/.test(k) && !RESERVED_KEY.test(k)) s.keys[c.id] = k;
@@ -75,7 +82,7 @@ function sanitize(raw) {
   return s;
 }
 
-function load() {
+export function loadSettings() {
   try { return sanitize(JSON.parse(localStorage.getItem(STORE_KEY))); } catch { return sanitize(null); }
 }
 
@@ -151,6 +158,9 @@ const STYLE = `
 .ps2s-fixed{color:var(--muted);font-size:12.5px}
 .ps2s-pads{margin:0 0 8px;padding:0;list-style:none;color:var(--muted);font-size:13px}
 .ps2s-pads li::before{content:"🎮 "}
+.ps2s-perf{display:grid;grid-template-columns:auto 1fr;gap:2px 14px;margin:6px 0 0;font-size:13px}
+.ps2s-perf dt{color:var(--muted)}
+.ps2s-perf dd{margin:0;overflow-wrap:anywhere}
 .ps2s-live{margin:0;padding:10px 22px;border-top:1px solid var(--line);font-size:13px;color:var(--muted);min-height:1.35em}
 .ps2s-live:empty{display:none}
 @media (max-width:600px){
@@ -167,16 +177,22 @@ const row = (name, title, hint, control) =>
 const toggle = (name) => `<input type="checkbox" role="switch" name="${name}">`;
 const range = (name, max) => `<input type="range" name="${name}" min="0" max="${max}" step="5"><output data-for="${name}"></output>`;
 
-// tv: crt-tv.js instance; getModule(): the Play! module or null; onChange(settings): after every change;
-// onClose(): after the panel closes.
-export function createSettings({ tv, getModule, onChange, onClose } = {}) {
+// tv: crt-tv.js instance; getModule(): the Play! module or null; onChange(settings, name): after every change;
+// onClose(): after the panel closes. autoDefaults: values of AUTO_KEYS for this machine (perf.js), used while
+// "Automático" is on and the player has not changed them; perfInfo(): [[label, value], ...] for the panel.
+export function createSettings({ tv, getModule, onChange, onClose, autoDefaults = {}, perfInfo } = {}) {
   if (!document.getElementById("ps2s-style")) {
     const st = document.createElement("style");
     st.id = "ps2s-style";
     st.textContent = STYLE;
     document.head.append(st);
   }
-  const s = load();
+  const s = loadSettings();
+  const ov = {}; // temporary values set by the adaptive quality (override()), not saved
+  function applyAuto() {
+    for (const k of AUTO_KEYS) if (!s.touched[k]) s[k] = s.perfAuto && k in autoDefaults ? autoDefaults[k] : DEFAULTS[k];
+  }
+  applyAuto();
   const dlg = document.createElement("dialog");
   dlg.className = "ps2s";
   dlg.setAttribute("aria-labelledby", "ps2s-h");
@@ -221,6 +237,12 @@ export function createSettings({ tv, getModule, onChange, onClose } = {}) {
         </table>
         <button type="button" class="ps2s-btn" data-act="reset-controls">Restaurar controles padrão</button>
         <p class="ps2s-note" data-unsupported hidden>Esta versão do emulador não permite trocar os controles.</p>
+      </section>
+      <section aria-labelledby="ps2s-h-perf">
+        <h3 id="ps2s-h-perf">Desempenho</h3>
+        ${row("perfAuto", "Automático", "Escolhe a qualidade pelo desempenho deste computador e, durante o jogo, alivia o efeito CRT, baixa a resolução ou pula quadros quando o emulador não consegue manter a velocidade total. O que você mudar à mão é mantido.", toggle("perfAuto"))}
+        <dl class="ps2s-perf" data-perf-info></dl>
+        <p class="ps2s-note" data-perf-status></p>
       </section>
       <section aria-labelledby="ps2s-h-adv">
         <h3 id="ps2s-h-adv">Avançado</h3>
@@ -283,16 +305,25 @@ export function createSettings({ tv, getModule, onChange, onClose } = {}) {
       tv?.setCrtParams(s);
     }
     if (!mod) return; // applied once the emulator is ready (applyEmulator)
-    if ((all || group === "gs") && mod.setGsOptions) mod.setGsOptions(s.resFactor, s.bilinear, s.widescreen, s.fill ? 0 : 1);
+    if ((all || group === "gs") && mod.setGsOptions) mod.setGsOptions(ov.resFactor ?? s.resFactor, s.bilinear, s.widescreen, s.fill ? 0 : 1);
     if ((all || group === "audio") && mod.setAudioVolume) mod.setAudioVolume(s.muted ? 0 : s.volume);
     if ((all || group === "limit") && mod.setFrameLimit) mod.setFrameLimit(s.frameLimit);
     if ((all || group === "input") && mod.setInputBindings) mod.setInputBindings(...bindings(s));
   }
 
-  function changed(group) {
+  function changed(group, name) {
+    if (AUTO_KEYS.includes(name)) { s.touched[name] = true; delete ov[name]; } // the player's choice wins
+    if (name === "perfAuto") applyAuto();
     save(s);
-    apply(group);
-    onChange?.(s);
+    apply(name === "perfAuto" ? undefined : group);
+    onChange?.(s, name);
+  }
+
+  let perfStatus = "";
+  function renderPerf() {
+    $("[data-perf-info]").innerHTML = (perfInfo?.() ?? []).map(([k, v]) => `<dt>${escapeHtml(k)}</dt><dd>${escapeHtml(v)}</dd>`).join("");
+    $("[data-perf-status]").textContent = perfStatus;
+    $("[data-perf-status]").hidden = !perfStatus;
   }
 
   function render() {
@@ -315,6 +346,7 @@ export function createSettings({ tv, getModule, onChange, onClose } = {}) {
       sec.querySelector("[data-unsupported]").hidden = ok;
     }
     for (const name of ["scanlines", "curvature", "bloom"]) $(`[name=${name}]`).disabled = !s.crt;
+    renderPerf();
     $("[name=volume]").disabled ||= s.muted;
   }
 
@@ -329,8 +361,8 @@ export function createSettings({ tv, getModule, onChange, onClose } = {}) {
     const el = e.target;
     if (!el.name || !(el.name in GROUP)) return;
     s[el.name] = el.type === "checkbox" ? el.checked : el.type === "range" ? Number(el.value) / 100 : Number(el.value);
+    changed(GROUP[el.name], el.name);
     render();
-    changed(GROUP[el.name]);
   });
 
   // ---- remapping ------------------------------------------------------------------------------
@@ -506,9 +538,19 @@ export function createSettings({ tv, getModule, onChange, onClose } = {}) {
     set(name, value) {
       if (!(name in GROUP) || s[name] === value) return;
       s[name] = value;
+      changed(GROUP[name], name);
       if (dlg.open) render();
-      changed(GROUP[name]);
     },
+    // Temporary value of a setting (adaptive quality), not saved; undefined drops it. Ignored for settings the
+    // player changed.
+    override(name, value) {
+      if (s.touched[name] && value !== undefined) return false;
+      if (value === undefined) delete ov[name]; else ov[name] = value;
+      apply(GROUP[name]);
+      return true;
+    },
+    effective: (name) => ov[name] ?? s[name],
+    setPerfStatus(text) { perfStatus = text; if (dlg.open) renderPerf(); },
   };
 }
 

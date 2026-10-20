@@ -54,13 +54,18 @@
   import { createConsoleScene } from "./js/console-scene.js";
   import { createCrtTv } from "./js/crt-tv.js";
   import { createLibraryUI, renderDiscLabel } from "./js/library.js";
-  import { createSettings, keyHint } from "./js/settings.js";
+  import { createSettings, keyHint, loadSettings } from "./js/settings.js";
+  import { detectHardware, pickDefaults, createAdaptive, TIER_NAMES } from "./js/perf.js";
   import { startBootIntro } from "./js/boot-intro.js";
 
   const $ = (id) => document.getElementById(id);
   const msg = (text, err = false) => { $("msg").textContent = text; $("msg").className = err ? "err" : ""; };
 
-  const view = createConsoleScene($("stage"));
+  // Performance profile of this machine (~0.1 s): starting quality, see js/perf.js.
+  const hw = await detectHardware();
+  const auto = pickDefaults(hw);
+  console.log("Perfil de desempenho:", JSON.stringify(hw), JSON.stringify(auto));
+  const view = createConsoleScene($("stage"), loadSettings().perfAuto ? auto.scene : {});
   let settings = null; // created right after the TV (it applies the CRT settings to it)
   const tv = createCrtTv({ sourceCanvas: $("outputCanvas"), frameId: emu.frameId, onCrtChange: (on) => settings?.set("crt", on) });
   view.tvAnchor.add(tv.object3d);
@@ -72,14 +77,56 @@
     $("keys").textContent = keyHint(s);
   }
   settings = createSettings({
-    tv, getModule: emu.getModule, onChange: syncHud,
+    tv, getModule: emu.getModule, autoDefaults: auto, perfInfo,
+    onChange: (s, name) => {
+      syncHud(s);
+      if (name === "perfAuto") { applyPerf(); if (s.perfAuto && !$("hud").hidden) adaptive.start(); else adaptive.stop(); }
+      if (name === "resFactor") adaptive.forget("res"); // the player's choice replaces the adaptive one
+    },
     onClose: () => { if (!$("hud").hidden) $("outputCanvas").focus(); }, // keys go back to the game
   });
   syncHud(settings.settings);
 
+  // ---- performance: profile defaults + adaptive quality while playing ----
+  const perfOn = () => settings.settings.perfAuto;
+  let crtStep = false; // adaptive step: cheap CRT shader
+  const applyTvQuality = () => tv.setQuality({ cheap: perfOn() && (auto.crtCheap || crtStep), maxPixelRatio: perfOn() ? auto.fsMaxPixelRatio : 2 });
+  function applyPerf() {
+    applyTvQuality();
+    const mod = emu.getModule();
+    mod?.setVu1Threaded?.(perfOn() ? auto.mtvu : true);
+    mod?.setAudioBufferMs?.(perfOn() ? auto.audioMs : 100);
+  }
+  const adaptive = createAdaptive({
+    getModule: emu.getModule, limiterOn: emu.limiterActive, cores: hw.cores,
+    canStep: (step) => step === "crt" ? settings.settings.crt && !auto.crtCheap
+      : step === "res" ? settings.effective("resFactor") > 1 && !settings.settings.touched.resFactor
+      : !!emu.getModule()?.setFrameSkip,
+    apply(step, on) {
+      console.info(`Desempenho: ${step} ${on ? "reduzido" : "restaurado"}`);
+      if (step === "crt") { crtStep = on; applyTvQuality(); }
+      else if (step === "res") settings.override("resFactor", on ? 1 : undefined);
+      else emu.getModule()?.setFrameSkip(on ? 1 : 0);
+    },
+    onStatus: (text) => settings.setPerfStatus(text && `Agora: ${text}.`),
+  });
+  function perfInfo() {
+    const mem = hw.memGB ? (hw.memGB >= 8 ? "8 GB ou mais" : `${hw.memGB} GB`) : "não informada pelo navegador";
+    const scene = auto.scene.shadows === false ? "cena 3D simples" : auto.scene.antialias === false ? "cena 3D sem antisserrilhado" : "cena 3D completa";
+    return [
+      ["Perfil detectado", TIER_NAMES[hw.tier]],
+      ["Processador", `${hw.cores} núcleos · velocidade ${Math.round(hw.score * 100)}% da referência`],
+      ["Memória", mem],
+      ["Placa de vídeo", hw.gpu || "não informada pelo navegador"],
+      ["Padrões", perfOn() ? [`resolução ${auto.resFactor}x`, auto.crt ? (auto.crtCheap ? "CRT leve" : "CRT completo") : "sem CRT", scene,
+        auto.mtvu ? "VU1 em thread própria" : "VU1 na thread principal", `som com ${auto.audioMs} ms de folga`].join(", ") : "desligados (qualidade completa)"],
+    ];
+  }
+  applyTvQuality();
+
   // Load the emulator in the background while the user browses the shelf.
   const emuReady = emu.init();
-  emuReady.then(() => settings.applyEmulator(), (e) => msg("Não foi possível iniciar o emulador: " + e.message, true));
+  emuReady.then(() => { settings.applyEmulator(); applyPerf(); }, (e) => msg("Não foi possível iniciar o emulador: " + e.message, true));
 
   let fpsTimer = 0, busy = false;
 
@@ -120,6 +167,7 @@
   // Going back pauses the emulator (CPU and audio idle); booting another game resets it.
   async function backToLibrary() {
     emu.pause();
+    adaptive.stop();
     $("hud").hidden = true;
     clearInterval(fpsTimer);
     if (tv.isFullscreen()) await tv.exitFullscreen();
@@ -137,6 +185,7 @@
     emu.takeFrames();
     clearInterval(fpsTimer);
     fpsTimer = setInterval(() => { $("fps").textContent = `${emu.takeFrames()} FPS`; }, 1000);
+    if (perfOn()) adaptive.start();
     $("outputCanvas").focus();
   }
 

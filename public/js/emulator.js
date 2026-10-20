@@ -101,6 +101,9 @@ function isBlack(bitmap) {
   return lit < 4;
 }
 
+// True while the frame limiter holds the game to real time (not during a fast start or with the limiter off).
+export const limiterActive = () => !fast && wanted.setFrameLimit !== false;
+
 function startFastStart(quiet) {
   if (!direct.setFrameLimit || !probe) return;
   fast = true;

@@ -43,6 +43,9 @@ vec2 barrel(vec2 uv) {
 }
 
 vec3 src(vec2 uv) {
+#ifdef CHEAP
+  return texture2D(tSrc, uv).rgb;
+#endif
   vec2 d = (uv - 0.5) * 0.0045 * crt * crtParams.y; // radial chromatic aberration
   return vec3(texture2D(tSrc, uv + d).r, texture2D(tSrc, uv).g, texture2D(tSrc, uv - d).b);
 }
@@ -75,7 +78,9 @@ void main() {
   if (p.x >= 0.0 && p.y >= 0.0 && p.x <= 1.0 && p.y <= 1.0) {
     if (signal > 0.5) {
       col = src(p);
+#ifndef CHEAP
       col += glow(p) * 0.15 * crt * crtParams.z;
+#endif
     } else {
       float n = hash(floor(p * vec2(320.0, 240.0)) + fract(time * 7.13) * 91.0);
       col = vec3(n * 0.75 + 0.1) * (0.9 + 0.1 * sin(p.y * 40.0 + time * 30.0));
@@ -95,8 +100,10 @@ void main() {
       // vignette, rolling bar, flicker, noise
       vec2 v = q * (1.0 - q);
       col *= mix(1.0, pow(clamp(v.x * v.y * 16.0, 0.0, 1.0), 0.22), crt);
+#ifndef CHEAP
       col *= 1.0 + crt * (0.018 * sin((q.y - time * 0.12) * 6.2831853) - 0.012 * sin(time * 113.0));
       col += crt * (hash(gl_FragCoord.xy + fract(time) * 61.0) - 0.5) * 0.035;
+#endif
     }
     // power line/dot: thin beam glows white
     col = mix(col, vec3(1.0), clamp(1.0 - power.y * 6.0, 0.0, 1.0) * 0.9);
@@ -342,6 +349,24 @@ export function createCrtTv({ sourceCanvas, frameId, onCrtChange, width = 0.7, s
     if (changed) onCrtChange?.(crtOn);
   }
 
+  // Cheap shader (one texture read: no bloom, chromatic aberration, flicker or noise; scanlines, mask, curvature
+  // and vignette stay) and the fullscreen pixel ratio cap, for weak GPUs (perf.js).
+  let cheap = false, fsMaxPixelRatio = 2;
+  function setQuality({ cheap: c = false, maxPixelRatio = 2 } = {}) {
+    if (!!c !== cheap) {
+      cheap = !!c;
+      for (const m of [screenMaterial, fs.mat]) {
+        if (!m) continue;
+        if (cheap) m.defines.CHEAP = ""; else delete m.defines.CHEAP;
+        m.needsUpdate = true;
+      }
+    }
+    fsMaxPixelRatio = maxPixelRatio;
+    fs.renderer?.setPixelRatio(Math.min(window.devicePixelRatio || 1, fsMaxPixelRatio));
+    fs.drawn = false;
+    dirty = true;
+  }
+
   // Strength of each part of the effect, 0 (off) .. 2; 1 is the default look.
   function setCrtParams({ scanlines = 1, curvature = 1, bloom = 1 } = {}) {
     const k = (v) => Math.max(0, Math.min(2, Number(v) || 0));
@@ -367,16 +392,16 @@ export function createCrtTv({ sourceCanvas, frameId, onCrtChange, width = 0.7, s
     mkBtn("Sair (Esc)", () => exitFullscreen());
     setCrtEffect(crtOn);
     const renderer = new THREE.WebGLRenderer({ antialias: false });
-    renderer.setPixelRatio(window.devicePixelRatio);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, fsMaxPixelRatio));
     renderer.domElement.style.cssText = "display:block;width:100%;height:100%";
     el.append(renderer.domElement, bar);
     el.addEventListener("mousemove", () => { fs.idle = 0; bar.style.opacity = "1"; el.style.cursor = "default"; });
-    const mat = new THREE.ShaderMaterial({ uniforms, vertexShader: FS_VERT, fragmentShader: CRT_FRAG, defines: { FULLSCREEN: "" }, depthTest: false });
+    const mat = new THREE.ShaderMaterial({ uniforms, vertexShader: FS_VERT, fragmentShader: CRT_FRAG, defines: cheap ? { FULLSCREEN: "", CHEAP: "" } : { FULLSCREEN: "" }, depthTest: false });
     const scene = new THREE.Scene();
     const quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), mat);
     quad.frustumCulled = false;
     scene.add(quad);
-    Object.assign(fs, { el, bar, renderer, scene, cam: new THREE.Camera() });
+    Object.assign(fs, { el, bar, renderer, scene, mat, cam: new THREE.Camera() });
   }
 
   async function enterFullscreen() {
@@ -472,7 +497,7 @@ export function createCrtTv({ sourceCanvas, frameId, onCrtChange, width = 0.7, s
   }
 
   return {
-    object3d, update, setPower, setSignal, setOverlay, setCrtEffect, setCrtParams,
+    object3d, update, setPower, setSignal, setOverlay, setCrtEffect, setCrtParams, setQuality,
     enterFullscreen, exitFullscreen, isFullscreen: () => fs.active, dispose,
   };
 }

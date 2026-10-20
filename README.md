@@ -32,7 +32,7 @@ To publish the site, see [DEPLOY.md](DEPLOY.md); to rebuild the emulator, see [B
 ## Related repositories
 
 - [brayanspagnol/Play-](https://github.com/brayanspagnol/Play-): the emulator fork. `public/emu/` is built
-  from branch `web-perf`, commit [`83f0271f`](https://github.com/brayanspagnol/Play-/commit/83f0271fbbd8b7b7513f57b1c987d03a29224980).
+  from branch `web-perf`, commit [`1654ec22`](https://github.com/brayanspagnol/Play-/commit/1654ec227eba48ccab9106725b4186ba11b8ce1c).
 - [brayanspagnol/Play--CodeGen](https://github.com/brayanspagnol/Play--CodeGen): its code generator
 
 ## License and credits

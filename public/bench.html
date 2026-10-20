@@ -94,6 +94,31 @@
     if (q.get("vu1thread") === "0") mod.setVu1Threaded(false);
     // &nolimit=1: frame limiter off (CPU per emulated vblank measurements)
     if (q.get("nolimit") === "1") mod.setFrameLimit(false);
+    // &frameskip=N: N frames not drawn after each drawn one (builds that export setFrameSkip)
+    if (q.get("frameskip") && mod.setFrameSkip) mod.setFrameSkip(Number(q.get("frameskip")));
+    // &res=N: internal resolution factor (1-4)
+    if (q.get("res") && mod.setGsOptions) mod.setGsOptions(Number(q.get("res")), false, false, 1);
+    // &auto=1: the site's automatic performance mode (js/perf.js profile defaults + adaptive quality; no TV here,
+    // so only the resolution and frame-skip steps); &vu1thread=0 / &res still force their value. -> bench.perf
+    if (q.get("auto") === "1") {
+      const { detectHardware, pickDefaults, createAdaptive } = await import("./js/perf.js");
+      const hw = await detectHardware({ remember: false }), d = pickDefaults(hw), res = Number(q.get("res")) || d.resFactor, steps = [], status2 = [];
+      mod.setGsOptions(res, false, false, 1);
+      if (q.get("vu1thread") === null) mod.setVu1Threaded(d.mtvu);
+      mod.setAudioBufferMs?.(d.audioMs);
+      const t0 = performance.now();
+      const adaptive = createAdaptive({
+        getModule: () => mod, limiterOn: () => q.get("nolimit") !== "1", cores: hw.cores, hidden: () => false,
+        onStatus: (t) => t && status2.push(`${Math.round((performance.now() - t0) / 1000)}s ${t}`),
+        canStep: (s) => s === "res" ? res > 1 : s === "skip" && !!mod.setFrameSkip,
+        apply(s, on) {
+          steps.push(`${Math.round((performance.now() - t0) / 1000)}s ${s}${on ? "-" : "+"}`);
+          if (s === "res") mod.setGsOptions(on ? 1 : res, false, false, 1); else mod.setFrameSkip(on ? 1 : 0);
+        },
+      });
+      adaptive.start();
+      bench.perf = { hw, defaults: d, steps, status: status2, active: adaptive.active };
+    }
     // &time=from,to: wall ms between vblanks [from, to) after the state load (mod.eeTimeResult())
     if (q.get("time") && mod.eeTimeAfterLoad) { const [a, b] = q.get("time").split(",").map(Number); mod.eeTimeAfterLoad(a, b); }
     if (q.get("hash") && mod.eeHashAfterLoad) mod.eeHashAfterLoad(Number(q.get("hash")));
