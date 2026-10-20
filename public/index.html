@@ -140,9 +140,11 @@
       library.hide();
       $("library").hidden = true;
       msg("");
-      // Boot while the disc and TV animations play (sound held until the game is on the TV).
+      // Boot while the disc and TV animations play (sound held until the game is on the TV). With the
+      // PS2 intro the game also waits at its first picture until the intro is over.
       let shown;
-      const booted = emuReady.then(() => emu.boot(file, { quietUntil: new Promise((r) => (shown = r)) }));
+      const onTv = new Promise((r) => (shown = r));
+      const booted = emuReady.then(() => emu.boot(file, { quietUntil: onTv, holdUntil: settings.settings.intro ? onTv : null }));
       booted.catch(() => {}); // handled below
       await view.insertDisc({ id: game.id, title: game.title, color: game.palette?.accent ?? "#5aa9ff", labelCanvas: renderDiscLabel(game) });
       tv.setSignal(false);

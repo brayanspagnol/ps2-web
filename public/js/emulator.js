@@ -51,7 +51,7 @@ export async function init() {
   // Remember what the page asks for, so a fast start (see boot) can override and then restore it.
   for (const k of ["setFrameLimit", "setAudioVolume"]) {
     const f = mod[k];
-    if (f) mod[k] = (v) => { wanted[k] = v; if (!fast) f(v); };
+    if (f) mod[k] = (v) => { wanted[k] = v; if (!fast && !held) f(v); };
     if (f) direct[k] = f;
   }
   mod.discImageDevice = new DiscImageDevice(mod);
@@ -64,6 +64,7 @@ export async function init() {
   const canvas = document.getElementById("outputCanvas");
   mod.onGsFrame = (bitmap) => {
     if (fast && !isBlack(bitmap)) endFastStart(true);
+    if (held && !held.paused && !isBlack(bitmap)) { held.paused = true; mod.pauseVm(); } // first picture: wait for the page
     if (canvas.width !== bitmap.width || canvas.height !== bitmap.height) {
       canvas.width = bitmap.width;
       canvas.height = bitmap.height;
@@ -131,7 +132,9 @@ function endFastStart(waitQuiet = false) {
 // options.fastStart = false boots at normal speed with sound (see "Fast start" above).
 // options.quietUntil: a promise; the sound stays muted until it settles (e.g. while the page still
 // animates before showing the game).
-export async function boot(file, { blockCache = true, fastStart = true, quietUntil = null } = {}) {
+// options.holdUntil: a promise (e.g. a boot intro playing on the TV); until it settles the game boots
+// at normal speed with no sound and stops at its first picture, so it starts from there afterwards.
+export async function boot(file, { blockCache = true, fastStart = true, quietUntil = null, holdUntil = null } = {}) {
   if (!mod) throw new Error("Chame init() antes de boot().");
   const dot = file.name.lastIndexOf(".");
   const ext = dot === -1 ? "" : file.name.slice(dot).toLowerCase();
@@ -141,7 +144,10 @@ export async function boot(file, { blockCache = true, fastStart = true, quietUnt
   gameKey = `${file.name}-${file.size}`;
   await setBlockCache(blockCache ? gameKey : null);
   endFastStart();
-  if (fastStart && FAST_START) startFastStart(quietUntil);
+  held = null; // a hold from an earlier boot ends with this one (bootDiscImage resumes the VM)
+  direct.setAudioVolume?.(wanted.setAudioVolume);
+  if (holdUntil && mod.resumeVm) holdBoot(holdUntil);
+  else if (fastStart && FAST_START) startFastStart(quietUntil);
   if (ext === ".elf") {
     const data = new Uint8Array(await file.arrayBuffer());
     mod.FS.writeFile(file.name, data);
@@ -162,7 +168,27 @@ export async function boot(file, { blockCache = true, fastStart = true, quietUnt
 // Stops emulation until the next boot() (emulation threads idle, audio suspended). Older builds keep running.
 export function pause() {
   endFastStart();
+  if (held) held = null; // stays paused; the next boot resets the VM
   mod?.pauseVm?.();
+}
+
+// ---- Hold (see boot's holdUntil) ------------------------------------------------------------------
+let held = null; // { paused } while the page holds the game
+
+function holdBoot(until) {
+  const h = (held = { paused: false });
+  direct.setFrameLimit?.(wanted.setFrameLimit);
+  direct.setAudioVolume?.(0);
+  const release = () => { if (held === h) releaseHold(); };
+  until.then(release, release);
+}
+
+function releaseHold() {
+  const h = held;
+  if (!h) return;
+  held = null;
+  if (h.paused) mod.resumeVm();
+  direct.setAudioVolume?.(wanted.setAudioVolume);
 }
 
 // The Play! module (debugging / measurements from the console), or null before init().
