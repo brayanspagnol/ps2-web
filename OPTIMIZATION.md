@@ -229,7 +229,7 @@ The earlier A/B of the flag alone with the limiter on (30 s from vblank 600) gav
 
 ## VU1 thread: microprogram block cache, block chaining, fewer flag writes (see notes/vu-jit.md)
 
-Branch `vu1-fast` (merged into web-perf as 10815f98). GTA SA's VU1 thread was ~24 ms/vbl (quiet box), right
+Branch `vu1-fast` (merged into web-perf as 992afde4). GTA SA's VU1 thread was ~24 ms/vbl (quiet box), right
 behind the VM thread; 50 vbl/s needs both under ~19.
 - **Block sets per micro memory contents** (8c94acd4): MPG uploads no longer drop the compiled VU blocks; dirty
   256-byte pages are rehashed before the next run and the executor switches to the block table of those contents
@@ -238,15 +238,18 @@ behind the VM thread; 50 vbl/s needs both under ~19.
 - **VU block chaining** (2c5d9300): a VU block without exception tail calls (`return_call_indirect`) the block at
   nPC from the executor's block table instead of returning to the dispatcher; VU blocks are also batched into
   shared modules like EE blocks. `Module.setVuBlockChaining(bool)`.
-- **Status/clip flag writes nothing reads** (135e48b2): the existing MAC-flag liveness analysis now also drops
-  sticky (status) and clip flag pipeline writes no reader can see. `Module.setVuSkipFlagWrites(bool)`; block cache
+- **Status/clip flag writes nothing reads** (135e48b2, VU1 only since a later fix): the existing MAC-flag liveness
+  analysis now also drops sticky (status) and clip flag pipeline writes no reader can see, in VU1 code. `Module.setVuSkipFlagWrites(bool)`; block cache
   codegen version 2 (old cached blocks are recompiled once).
 
 State hashes (`hash=300&vu1thread=0&nolimit=1`): block cache, SIMD and chaining identical (car 55dab76e, play
 1f851c1c, mtvu-ffx 5927b89c, gow-fight 718a88cc, VU memories too). With flag skipping the EE/VU state hashes of
 car and play change only in the flag pipeline arrays: `vuHashResult` now also prints EE/VU0/VU1 state hashes
 without those arrays, identical with skipping on and off (car, play, gow-fight), all memories identical;
-mtvu-ffx and gow-fight EE hashes unchanged.
+mtvu-ffx and gow-fight EE hashes unchanged. The first version also skipped them in VU0 code, whose pipelines are
+copied into the EE context, so the EE state bytes changed; restricted to VU1, EE hashes are identical again (car,
+play, gow-fight, mtvu-ffx), only the VU1 state hash differs. Merged build (web-perf 992afde4): car 55dab76e, play
+1f851c1c, mtvu-ffx 5927b89c, gow-fight 77f177fc, gow-intro b2119704 (= web-perf d215ce84).
 
 Timing, release, MTVU on, no limiter, vblanks 100-600, warm cache, quiet box (load ~3, last 2 ABAB rounds; earlier
 rounds were taken with load 13-17 and swap full and are not used). VU1 = CPU ms/vbl of the VU1 worker thread

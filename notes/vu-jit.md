@@ -70,9 +70,30 @@ local branch `vu-jit`, pushed to `fork` (https://github.com/brayanspagnol/Play--
 - PROFILE builds: vuBlocks / "blocks/program" counter is meaningless with VU1 threaded (exchanged by getProfile on
   another thread), and per-block zone swaps inflate VU time a lot.
 
+## 2026-10-20: VU1 thread for GTA SA (branch `vu1-fast`, worktree `play-vu1`, merged into web-perf 992afde4)
+- Block sets per micro memory contents (8c94acd4): `CVuExecutor` marks 256-byte micro memory pages dirty on writes,
+  rehashes them before the next run and switches the block lookup table to the set for those contents (<= 64 sets).
+  Replaces ClearActiveBlocksInRange + BlockFactory after every MPG (8-10% of the VU1 thread in notes/gta-profile.md).
+- VIF unpack runs with wasm SIMD (5bb13f63). Measured: within noise on the VU1 thread (~0.0-0.3 ms/vbl).
+- VU block chaining (2c5d9300): epilog tail calls the block at nPC through `CMIPS::m_blockFnLookup` = the executor's
+  `CBasicBlock*` table (refreshed every Execute: MTVU has two executors on the VU1 context; block sets switch it);
+  the wasm function index is read from `CBasicBlock::m_chainFunctionIndex`. Empty block returns to the executor.
+  Off in diff mode. VU blocks are batched into modules like EE blocks (`CBasicBlock::BatchModules`).
+- Flag writes (135e48b2; VU1 code only after the follow-up fix: VU0 flag pipelines are copied into the EE context,
+  so skipping there changed EE state hashes): `ComputeSkipFlagsHints` (upstream, MAC only) extended to sticky/status (same writers and
+  readers as MAC) and clip (CLIP / FCEQ FCAND FCOR FCGET via new `OPERANDSET::read/writeClipFlags`). Skipped entries
+  are never selected by `CheckFlagPipeline` (a newer entry is visible before any read and by block end + 4); the
+  next sticky/clip update takes the latest value from the forwarding scratch, so skipping needs promotion and is off
+  in diff mode. Validation: `vuHashResult` has 3 extra components after `/` (EE, VU0, VU1 state without flag
+  pipeline arrays); identical with `setVuSkipFlagWrites(false)` vs default on car/play/gow-fight; bench.html
+  `&vuflagskip=0`. Block cache CODEGEN_VERSION 2.
+- Result (quiet box, OPTIMIZATION.md table): VU1 thread CPU play 20.4 -> 18.4 ms/vbl, car 29.0 -> ~26 (-10%):
+  block sets ~-6..-12%, chaining ~-2%, flags ~-2%. Wall unchanged (VM thread is the limit at ~25.8 ms/vbl on play).
+- Tools: scratchpad `vu1/run.mjs` (CDP runner: one tab, `hash` or `time` mode, per-thread CPU of the tab's renderer),
+  `abab.sh`, `masked.sh`. Variants: public/emu-vu1c (block sets), -vu1s (+SIMD), -vu1j (+chaining), -vu1f (+flags),
+  -vu1wp (web-perf merge).
+
 ## Next steps
-1. Superblocks: only worth retrying with a different shape (e.g. wasm tail calls between blocks like ee-jit, or
-   superblocks limited to loops whose parts share most symbols); not a priority while VU1 is not the bottleneck.
-2. Then: measure EE effect of the helper-call fix; consider promotion for EE blocks (needs diff harness for EE).
-3. Flag ring writes: only last <=5 entries matter for later queries (needs query-equivalence diff instead of
-   byte equality).
+1. VU1 is now ~18.4 ms/vbl on play (quiet box): under the ~19 needed for 50 vbl/s. The VM thread is next.
+2. More flag work: MAC/sticky/clip values are still computed when unused (only the ring writes are skipped).
+3. Superblocks: obsolete with chaining unless a loop-shaped variant is tried.
