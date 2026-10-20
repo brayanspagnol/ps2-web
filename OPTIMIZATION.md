@@ -227,6 +227,46 @@ wall ms/vbl over vblanks 100-600, ABAB, 2 rounds, load 3-5 from other agents:
 
 The earlier A/B of the flag alone with the limiter on (30 s from vblank 600) gave -4.4% ms/vbl on play.zip.
 
+## VU1 thread: microprogram block cache, block chaining, fewer flag writes (see notes/vu-jit.md)
+
+Branch `vu1-fast` (merged into web-perf as 10815f98). GTA SA's VU1 thread was ~24 ms/vbl (quiet box), right
+behind the VM thread; 50 vbl/s needs both under ~19.
+- **Block sets per micro memory contents** (8c94acd4): MPG uploads no longer drop the compiled VU blocks; dirty
+  256-byte pages are rehashed before the next run and the executor switches to the block table of those contents
+  (up to 64 sets kept). GTA swaps microprograms all the time and now finds its blocks again.
+- **VIF unpack with wasm SIMD** (5bb13f63): runs of contiguous read+written vectors converted with SIMD.
+- **VU block chaining** (2c5d9300): a VU block without exception tail calls (`return_call_indirect`) the block at
+  nPC from the executor's block table instead of returning to the dispatcher; VU blocks are also batched into
+  shared modules like EE blocks. `Module.setVuBlockChaining(bool)`.
+- **Status/clip flag writes nothing reads** (135e48b2): the existing MAC-flag liveness analysis now also drops
+  sticky (status) and clip flag pipeline writes no reader can see. `Module.setVuSkipFlagWrites(bool)`; block cache
+  codegen version 2 (old cached blocks are recompiled once).
+
+State hashes (`hash=300&vu1thread=0&nolimit=1`): block cache, SIMD and chaining identical (car 55dab76e, play
+1f851c1c, mtvu-ffx 5927b89c, gow-fight 718a88cc, VU memories too). With flag skipping the EE/VU state hashes of
+car and play change only in the flag pipeline arrays: `vuHashResult` now also prints EE/VU0/VU1 state hashes
+without those arrays, identical with skipping on and off (car, play, gow-fight), all memories identical;
+mtvu-ffx and gow-fight EE hashes unchanged.
+
+Timing, release, MTVU on, no limiter, vblanks 100-600, warm cache, quiet box (load ~3, last 2 ABAB rounds; earlier
+rounds were taken with load 13-17 and swap full and are not used). VU1 = CPU ms/vbl of the VU1 worker thread
+(`/proc/<renderer>/task/*/schedstat`):
+
+| play.zip | base (public/emu) | + block sets | + SIMD unpack | + chaining | + flags |
+|---|---|---|---|---|---|
+| wall ms/vbl | 26.26 / 26.78 | 26.05 / 25.60 | 25.99 / 26.10 | 26.15 / 26.15 | 25.83 / 25.59 |
+| VU1 CPU ms/vbl | 20.24 / 20.62 | 18.95 / 19.25 | 19.33 / 19.10 | 18.64 / 18.72 | 18.24 / 18.62 |
+
+| car.zip | base | + block sets | + SIMD unpack | + chaining | + flags |
+|---|---|---|---|---|---|
+| wall ms/vbl | 31.62 / 35.27 | 32.65 / 32.36 | 31.94 / 31.63 | 33.11 / 31.79 | 31.10 / 32.81 |
+| VU1 CPU ms/vbl | 28.93 / 29.05 | 25.59 / 25.57 | 26.41 / 25.67 | 24.97 / 25.24 | 25.37 / 26.82 |
+
+VU1 thread -10% (play 20.4 -> 18.4, car 29.0 -> ~26); most of it from the block sets, chaining and flags ~2% each,
+the SIMD unpack within noise. Wall time is unchanged: the VM thread (25.8 ms/vbl on play) is the limit, so this
+buys headroom for VM-thread work rather than speed by itself. gow-fight wall times varied 7-31 ms/vbl between runs
+of the same build (not usable).
+
 ## Tier-2 EE regions (not published, see notes/tier2-m2b.md)
 
 Hot EE entries compiled as regions (up to 16 tier-1 blocks of one 4 KB page in one structured wasm function,
@@ -235,6 +275,22 @@ cold boot reaches the intro, but slower: wall ms/vbl over vblanks 100-600 (VU1 o
 rounds) play.zip 40.3 -> 46.5 (+15%), car.zip 46.3 -> 57.8 (+25%), gow-fight 58.8 -> 76.6 (+30%), mtvu-ffx
 33.9 -> 35.7 (noise); car.zip steady state (1100-1600) 34.0 -> 35.4. Likely cause: region churn (regions span data
 between their parts, data writes drop them, hot entries rebuild them; ~500 regions/s at GTA cold boot). Off by default.
+
+## Automatic EE wait loops, IPU CSC (Play `web-perf` d215ce84, see notes/auto-idle.md)
+
+- **Wait loop detection** (`CWaitLoopAnalyzer`, EeExecutor.cpp): loops whose iterations only read memory / side
+  effect free hardware registers and leave their registers unchanged end the EE slice like a GameConfig
+  `IdleLoopBlock`; multi-block loops, calls (3 deep) and FlushCache syscalls are covered, unsafe side paths only
+  mark the pass as not idle. It finds God of War's vsync / flag / SIF RPC polls, so its 4 `IdleLoopBlock` entries
+  were removed. Same speed as the per-game entries on every bench state (EE busy share identical), generic for
+  other games and regions. Hashes identical on car/play/mtvu-ffx; gow-fight 718a88cc -> 77f177fc (the detector
+  idles on the second identical pass, an IdleLoopBlock on the first).
+- **IPU CSC**: the 384 bytes of a macroblock are read from the input FIFO in one copy instead of one
+  `TryGetBits_MSBF(8)` per byte, and YCbCr -> RGBA runs 4 pixels at a time with wasm SIMD (same float operations,
+  bit identical, self-checked against the scalar loop). God of War opening movie (gow-intro.zip, EE 100% busy,
+  VM thread bound): 22.4 / 22.9 / 24.6 -> 19.1 / 21.8 / 19.3 ms/vbl (about -15%, ~44 -> ~52 vbl/s without limiter).
+  Hashes unchanged (gow-intro b2119704). Left: BDEC VLC decoding (~9% of the VM thread in movies) and the game's own
+  EE bitstream code (~80% of EE samples in that movie).
 
 ## Remaining bottlenecks / next steps
 
