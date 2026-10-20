@@ -295,6 +295,17 @@ between their parts, data writes drop them, hot entries rebuild them; ~500 regio
   Hashes unchanged (gow-intro b2119704). Left: BDEC VLC decoding (~9% of the VM thread in movies) and the game's own
   EE bitstream code (~80% of EE samples in that movie).
 
+## Async block compile (see notes/stutter.md)
+
+New blocks no longer stall the thread that runs them: the front end runs there, the block runs at once in the
+CodeGen statement interpreter (`CInterpreterProgram`, same results as the compiled code), 2 helper threads run
+the Jitter optimizer + wasm codegen and batch finished blocks; the owner thread instantiates each batch (<= 64
+functions, a few ms) on its next dispatch and the block switches to compiled code. Linked with mimalloc
+(dlmalloc's lock made the helpers and the VM thread stall each other). State hashes unchanged, also with an
+empty block cache. GTA play.zip, empty cache: VM-thread compile 15.3 s -> 4.0 s per 45 s, worst frame 986 ->
+607 ms, p99 456 -> 197 ms; warm cache p99 313 -> 118 ms. Open: steady-state cost on FFX / GoW intro to re-check
+on a quiet machine (notes/stutter.md).
+
 ## Remaining bottlenecks / next steps
 
 1. EE JIT code quality and dispatch: every block returns to the C++ dispatcher (no block linking on

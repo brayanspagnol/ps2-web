@@ -252,7 +252,7 @@ export async function loadState() {
 // which stutters when new code shows up and after loading a state. Compiled modules are kept in
 // OPFS (blockcache/<game>/<n>.bin: header + entries appended by the emulator) and fed back
 // before the next boot, so already-seen code skips the compiler. Every segment carries a salt
-// that changes with each Play.wasm build; segments from another build are deleted on load.
+// that changes when the code generator changes; segments with another salt are deleted on load.
 const BC_MAGIC = "PLAYBLK1";
 const BC_MAX_SEGMENTS = 16; // merged into one file at load beyond this
 let bc = null;              // { dirName, next, header, lastFlush }
@@ -260,10 +260,16 @@ let bcTimer = null;
 let bcFlushing = null;
 
 async function bcHeader() {
-  const r = await fetch(EMU_DIR + "Play.wasm", { method: "HEAD", cache: "no-store" });
-  const h = (k) => r.headers.get(k) ?? "";
-  if (!r.ok || !(h("etag") || h("last-modified"))) return null; // can't tell builds apart
-  const salt = new TextEncoder().encode(`${h("etag")}|${h("last-modified")}|${h("content-length")}`);
+  // Builds with blockCacheSalt() name their code generator (hash of the JIT sources + context layout), so
+  // the cache survives rebuilds that cannot change the generated code. Older builds: the Play.wasm file.
+  let saltText = mod.blockCacheSalt ? `src:${mod.blockCacheSalt()}` : null;
+  if (!saltText) {
+    const r = await fetch(EMU_DIR + "Play.wasm", { method: "HEAD", cache: "no-store" });
+    const h = (k) => r.headers.get(k) ?? "";
+    if (!r.ok || !(h("etag") || h("last-modified"))) return null; // can't tell builds apart
+    saltText = `${h("etag")}|${h("last-modified")}|${h("content-length")}`;
+  }
+  const salt = new TextEncoder().encode(saltText);
   const header = new Uint8Array(12 + salt.length);
   header.set(new TextEncoder().encode(BC_MAGIC));
   new DataView(header.buffer).setUint32(8, salt.length, true);
@@ -325,7 +331,8 @@ export async function setBlockCache(gameKey) {
     bc = { dirName, next, header, lastFlush: performance.now() };
     mod.blockCacheEnable(true);
     bcTimer = setInterval(() => {
-      if (mod.blockCachePendingSize() >= (1 << 20) || performance.now() - bc.lastFlush > 30000) flushBlockCache();
+      // (10 s: blocks compiled near the end of a session are lost if the tab closes before a flush)
+      if (mod.blockCachePendingSize() >= (1 << 20) || performance.now() - bc.lastFlush > 10000) flushBlockCache();
     }, 5000);
     console.log(`Block cache "${gameKey}": ${entries} blocks loaded${stale ? " (old build discarded)" : ""}${bad ? `, ${bad} bad segment(s) dropped` : ""}.`);
   } catch (e) {
@@ -342,7 +349,7 @@ async function bcWrite(dir, name, header, body) {
   await w.close();
 }
 
-// Writes blocks compiled since the last flush to OPFS (runs every 30 s / 1 MB and when the page hides).
+// Writes blocks compiled since the last flush to OPFS (runs every 10 s / 1 MB and when the page hides).
 export function flushBlockCache() {
   bcFlushing ??= (async () => {
     const cur = bc;

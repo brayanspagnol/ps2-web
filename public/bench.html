@@ -72,6 +72,10 @@
     if (q.get("vujit") && mod.setVuJitOptions) { const [p, d, n] = q.get("vujit").split(",").map(Number); mod.setVuJitOptions(!!p, !!d, !!n); }
     // &eebatch=N: EE blocks per batch wasm module (0 = one module per block; builds that export setEeBatchSize)
     if (q.get("eebatch") && mod.setEeBatchSize) mod.setEeBatchSize(Number(q.get("eebatch")));
+    // &async=0|1|2: block compile on the VM thread / on a helper thread while interpreting (default) / interpret only (testing)
+    if (q.get("async") && mod.setAsyncCompile) mod.setAsyncCompile(Number(q.get("async")));
+    // &helpers=N: async compile helper threads (builds that export setAsyncCompileHelpers)
+    if (q.get("helpers") && mod.setAsyncCompileHelpers) mod.setAsyncCompileHelpers(Number(q.get("helpers")));
     // &eeregion=N: EE regions, blocks within N bytes compiled into one function (0 = off; builds that export setEeRegionSpan)
     if (q.get("eeregion") && mod.setEeRegionSpan) mod.setEeRegionSpan(Number(q.get("eeregion")));
     // &brsel=0|1: MIPS branches and block epilogues with selects instead of if/else (builds that export setJitBranchSelect)
