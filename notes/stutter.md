@@ -1,6 +1,6 @@
 # Stutter: compiling never blocks the game (branch `no-stutter`, merged into web-perf e0e7c919)
 
-Status 2026-10-20: published (`public/emu` = web-perf e0e7c919). Machine was heavily loaded all day (other
+Status 2026-10-21: published, steady-state A/B settled (`public/emu` = web-perf e0e7c919). Machine was heavily loaded all day (other
 agents' builds/benches, MemAvailable 2-4 GB, the test Brave was OOM-killed once), so frame-time numbers are noisy;
 the compile-stall numbers are robust.
 
@@ -75,12 +75,26 @@ Presented-frame interval ms; cmpVM = VM-thread compile s per run; c>33 = vblanks
 (> 33 ms is ~100% everywhere: these games present at 25-30 fps on this machine.)
 - Compile stalls fall 3-10x everywhere (VM compile time, worst vblank, vblanks > 33 ms of compile); worst frame
   falls in 6 of 8 cases (GTA cold 986 -> 607, warm 638 -> 246; GoW fight cold 880 -> 391).
-- **Open risk**: FFX and GoW intro warm, where compile is ~0 in both builds, are slower with the new build in
-  these rounds, and one deterministic A/B (warm, no limiter, vblanks 100-600 ms/vbl) gave GoW fight 16.8 -> 20.6
-  and FFX 34.6 -> 35.5, with the GS thread also busier (8.1 -> 11.1 ms/vbl, code it doesn't touch) - either
-  machine noise or a steady-state cost of mimalloc (cross-thread frees between VU1/GS threads). Next step: on a
-  quiet machine, ABAB `time=100,600` warm of base / new / new relinked with dlmalloc; if mimalloc is the cost,
-  drop it and cut allocator contention another way (one helper, per-thread arenas in the Jitter).
+- **Steady-state check (2026-10-21, settled)**: the FFX / GoW intro warm slowdown above was machine noise.
+  Warm cache, no limiter, wall ms/vbl over vblanks 100-600 after the state load, 5 rounds with the build order
+  rotated (plus a discarded warm-up round), quieter machine (one other agent). Base = 992afde4 (50027da9 only adds
+  the resumeVm export), pub = published e0e7c919 (mimalloc), pubdl = e0e7c919 relinked with dlmalloc:
+
+  | state | build | median ms/vbl | min | mean | GS busy | VU1 busy |
+  |---|---|---|---|---|---|---|
+  | gow-fight | base | 17.69 | 14.91 | 19.78 | 11.10 | 19.53 |
+  | gow-fight | pub | 15.42 | 15.22 | 17.48 | 9.07 | 17.28 |
+  | gow-fight | pubdl | 16.31 | 15.02 | 16.73 | 8.58 | 16.64 |
+  | gow-intro | base | 25.46 | 20.88 | 26.31 | 2.29 | 0.24 |
+  | gow-intro | pub | 25.62 | 19.19 | 27.53 | 2.55 | 0.27 |
+  | gow-intro | pubdl | 24.35 | 19.63 | 26.04 | 2.39 | 0.24 |
+  | mtvu-ffx | base | 31.23 | 27.73 | 34.34 | 16.28 | 26.80 |
+  | mtvu-ffx | pub | 30.95 | 29.62 | 31.42 | 14.51 | 24.78 |
+  | mtvu-ffx | pubdl | 32.79 | 29.24 | 31.83 | 17.53 | 30.35 |
+
+  Run-to-run spread is +-30% and GS busy (code these builds share) moves with wall time, i.e. the machine's speed,
+  not the build. No build is consistently slower; mimalloc costs nothing measurable in steady state and is what
+  keeps the cold-compile gain (dlmalloc: VM-thread front end 4x slower), so the published build stays.
 
 ## Files
 Scratchpad `stutter/`: `run.mjs` (CDP runner: own tab closed in finally/on signals, frame hook, worker errors,
