@@ -53,7 +53,7 @@
   import * as emu from "./js/emulator.js";
   import { createConsoleScene } from "./js/console-scene.js";
   import { createCrtTv } from "./js/crt-tv.js";
-  import { createLibraryUI, renderDiscLabel } from "./js/library.js";
+  import { createLibraryUI, renderDiscLabel, listServerGames } from "./js/library.js";
   import { createSettings, keyHint, loadSettings } from "./js/settings.js";
   import { detectHardware, pickDefaults, createAdaptive, TIER_NAMES } from "./js/perf.js";
   import { startBootIntro } from "./js/boot-intro.js";
@@ -98,7 +98,7 @@
     mod?.setAudioBufferMs?.(perfOn() ? auto.audioMs : 100);
   }
   const adaptive = createAdaptive({
-    getModule: emu.getModule, limiterOn: emu.limiterActive, cores: hw.cores,
+    getModule: emu.getModule, limiterOn: emu.limiterActive, cores: hw.cores, frames: emu.frameId,
     canStep: (step) => step === "crt" ? settings.settings.crt && !auto.crtCheap
       : step === "res" ? settings.effective("resFactor") > 1 && !settings.settings.touched.resFactor
       : !!emu.getModule()?.setFrameSkip,
@@ -229,6 +229,19 @@
     clearTimeout(idleTimer);
     idleTimer = setTimeout(() => $("hud").classList.add("idle"), 3000);
   });
+  // Dev/measurement only (notes/site-perf.md): ?play=<file in games/>[&state=<OPFS file at the root, as bench.html>]
+  // boots that game through the normal play path, then loads the state; window.__site exposes the page parts.
+  const dev = new URLSearchParams(location.search);
+  if (dev.get("play")) {
+    window.__site = { emu, view, tv, settings, adaptive };
+    const g = (await listServerGames()).find((x) => x.file.name === dev.get("play"));
+    if (!g) msg(`?play: ${dev.get("play")} não está em games/`, true);
+    else {
+      await play(g.game, g.file);
+      if (dev.get("state")) await emu.loadState(await (await navigator.storage.getDirectory()).getFileHandle(dev.get("state")))
+        .then(() => msg("dev: estado carregado"), (e) => msg(`dev: ${e.message}`, true));
+    }
+  }
 </script>
 </body>
 </html>

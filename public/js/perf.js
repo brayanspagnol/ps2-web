@@ -113,15 +113,21 @@ export const TIER_NAMES = { alto: "Alto", medio: "Intermediário", basico: "Bás
 // ---- Adaptive quality ----------------------------------------------------------------------------------
 // Every 2 s it reads the emulator's per-vblank timeline. The frame limiter's sleep time says whether the game
 // runs at full speed: a limiter that never sleeps means the machine can't keep up (whatever the game's frame
-// rate is). Slow for 3 windows in a row -> next step down; limiter sleeping >= 25% of the time for 5 windows
-// -> undo the last step. A step-up that leads back to slow within 20 s blocks step-ups for 30 s, doubling each
-// time (no flapping). Steps: lighter CRT shader, internal resolution 1x, frame skip (1 of 2 frames not drawn).
+// rate is). With VU1 on its own thread there is a second kind of slow: the VU1 thread busy all the time while the
+// VM still keeps full speed; the game then drops frames (God of War fights: 60 vblanks/s but ~22 frames/s), so a
+// saturated VU1 thread counts as slow too, and steps are judged by frames shown per second (hooks.frames) when
+// known, not by vblanks (frame skip, which hides frames on purpose: by vblanks). Slow for 3 windows in a row ->
+// next step down; limiter sleeping >= 25% of the time (VU1 not saturated) for 5 windows -> undo the last step.
+// A step-up that leads back to slow within 20 s blocks step-ups for 30 s, doubling each time (no flapping). Steps: lighter CRT shader, internal resolution 1x, frame skip (1 of 2 frames not drawn).
 // The resolution and frame-skip steps only help when the GS thread / GPU is the bottleneck (GS busy most of
-// the vblank, or the VM/VU1 waiting for it), or on machines with <= 4 cores where every thread competes; a
+// the vblank, or the VM/VU1 waiting for it), on machines with <= 4 cores where every thread competes, or with
+// the VU1 thread saturated (on an integrated GPU the GS load at 2x slows the CPU threads too: gow-fight at 1x
+// went from ~22 to ~30 frames/s with the GS only ~55% busy, notes/site-perf.md); a
 // step that did not raise the speed (frame skip: by 20%, or to full speed) is undone and not tried again until
 // the next game.
 // hooks: { getModule, limiterOn() -> bool, cores, canStep(step) -> bool, apply(step, on), onStatus(text),
-//   hidden() -> bool (default: document.hidden; bench.html runs in background tabs) }
+//   hidden() -> bool (default: document.hidden; bench.html runs in background tabs),
+//   frames() -> count of frames shown so far, or null (optional) }
 export const STEPS = ["crt", "res", "skip"];
 const STEP_NAMES = { crt: "efeito CRT leve", res: "resolução 1x", skip: "pulando 1 de cada 2 quadros" };
 
@@ -129,20 +135,26 @@ export function createAdaptive(hooks) {
   let timer = 0, next = null, active = [], slowRun = 0, fastRun = 0, cooldown = 0;
   let upBackoff = 30000, upBlockedUntil = 0, lastUpAt = 0, trial = null;
   const useless = new Set(); // steps that did not help in this game session
-  let last = null, recent = []; // last window's metrics, last 3 speeds
+  let last = null, recent = []; // last window's metrics, the last 3 windows' metrics
+  let frames0 = null; // hooks.frames() at the start of the window
 
   function windowMetrics(mod) {
     let tl;
     try { tl = JSON.parse(mod.getTimeline(next ?? 1e15)); } catch { return null; }
     const first = next === null;
     next = tl.next;
+    const f = hooks.frames?.() ?? null, f0 = frames0;
+    frames0 = f;
     if (first || !tl.rows.length) return null;
     const c = Object.fromEntries(tl.cols.map((n, i) => [n, i]));
     const sum = (k) => tl.rows.reduce((a, r) => a + (r[c[k]] || 0), 0);
     const wall = sum("wall");
     if (wall <= 0) return null;
+    const vbl = tl.rows.length * 1000 / wall;
     return {
-      vbl: tl.rows.length * 1000 / wall,
+      vbl,
+      speed: f !== null && f0 !== null ? (f - f0) * 1000 / wall : vbl, // frames/s shown, or vblanks/s
+      vu1Busy: sum("vu1busy") / wall,
       limiter: sum("limiter") / wall,
       gsBusy: sum("gsbusy") / wall,
       gsWait: (sum("gswait") + sum("vu1gswait")) / wall,
@@ -151,18 +163,22 @@ export function createAdaptive(hooks) {
 
   function status() {
     const parts = active.map((s) => STEP_NAMES[s]);
-    hooks.onStatus?.(last ? `${Math.round(last.vbl)} quadros/s${parts.length ? ` · reduzido: ${parts.join(", ")}` : " · qualidade completa"}` : "");
+    hooks.onStatus?.(last ? `${Math.round(last.speed)} quadros/s${parts.length ? ` · reduzido: ${parts.join(", ")}` : " · qualidade completa"}` : "");
   }
 
+  const rate = (step, m) => step === "skip" ? m.vbl : m.speed; // what a step is judged by
   function stepDown(m, now) {
     const gsBound = m.gsBusy > 0.8 || m.gsWait > 0.05 || hooks.cores <= 4;
+    const vu1Bound = m.vu1Busy > 0.9;
     for (const s of STEPS) {
       if (active.includes(s) || !hooks.canStep(s)) continue;
-      if (s !== "crt" && !gsBound) continue;
+      // frame skip only drops host drawing: it can't help a saturated VU1 thread, and halves the frames shown
+      if (s === "res" ? !gsBound && !vu1Bound : s === "skip" && !gsBound) continue;
       if (useless.has(s)) continue;
       active.push(s);
       hooks.apply(s, true);
-      trial = { step: s, before: recent.reduce((a, b) => a + b, 0) / recent.length, windows: 0, sum: 0 };
+      // byVu1: taken for the VU1 thread alone; it must show more frames even if the VU1 thread is no longer saturated
+      trial = { step: s, before: recent.reduce((a, r) => a + rate(s, r), 0) / recent.length, windows: 0, sum: 0, byVu1: !gsBound && vu1Bound };
       return true;
     }
     return false;
@@ -174,19 +190,19 @@ export function createAdaptive(hooks) {
     const m = windowMetrics(mod);
     if (!m) return;
     last = m;
-    recent = [...recent.slice(-2), m.vbl]; // speed over the last 3 windows (before a step)
+    recent = [...recent.slice(-2), m]; // speed over the last 3 windows (before a step)
     const now = performance.now();
-    const slow = m.limiter < 0.02;
-    const headroom = m.limiter >= 0.25;
+    const slow = m.limiter < 0.02 || m.vu1Busy > 0.9;
+    const headroom = m.limiter >= 0.25 && !slow;
     slowRun = slow ? slowRun + 1 : 0;
     fastRun = headroom ? fastRun + 1 : 0;
     // The first window after a step is skipped (a resolution change rebuilds the GS framebuffers), the next 3 count.
     if (trial && ++trial.windows <= 4) {
-      if (trial.windows > 1) trial.sum += m.vbl;
+      if (trial.windows > 1) trial.sum += rate(trial.step, m);
       // Did not help: undo, try the next step. Frame skip halves the frames shown, so it must bring full speed
       // or a big gain to stay.
       const need = trial.step === "skip" ? 1.2 : 1.03;
-      if (trial.windows === 4 && slow && trial.sum / 3 < trial.before * need) {
+      if (trial.windows === 4 && (slow || trial.byVu1) && trial.sum / 3 < trial.before * need) {
         active = active.filter((s) => s !== trial.step);
         hooks.apply(trial.step, false);
         useless.add(trial.step);
@@ -211,7 +227,7 @@ export function createAdaptive(hooks) {
 
   return {
     // Starts watching (on game start); stop() undoes every step.
-    start() { if (!timer) { next = null; timer = setInterval(tick, hooks.intervalMs ?? 2000); } },
+    start() { if (!timer) { next = null; frames0 = null; timer = setInterval(tick, hooks.intervalMs ?? 2000); } },
     stop() {
       clearInterval(timer); timer = 0; next = null; last = null; trial = null; recent = [];
       for (const s of active.reverse()) hooks.apply(s, false);

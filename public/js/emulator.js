@@ -238,10 +238,10 @@ export async function hasSavedState() {
   try { await stateFile(false); return true; } catch { return false; }
 }
 
-export async function loadState() {
+// fh (optional): another OPFS file handle to load instead of this game's slot (dev: index.html ?state=).
+export async function loadState(fh) {
   if (!mod || !gameKey) throw new Error("Nenhum jogo rodando.");
-  let fh;
-  try { fh = await stateFile(false); } catch { throw new Error("Este jogo ainda não tem um estado salvo."); }
+  if (!fh) try { fh = await stateFile(false); } catch { throw new Error("Este jogo ainda não tem um estado salvo."); }
   mod.FS.writeFile("/work/quick.zip", new Uint8Array(await (await fh.getFile()).arrayBuffer()));
   mod.loadState("/work/quick.zip");
   if (!(await waitState())) throw new Error("Não foi possível carregar o estado.");
