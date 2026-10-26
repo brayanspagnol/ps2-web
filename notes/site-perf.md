@@ -25,14 +25,18 @@ boots through the normal play path and loads a bench state (`window.__site` expo
 | variant (gow-fight, 3440x1440) | runs | vblanks/s | frames/s |
 |---|---|---|---|
 | bench.html res=2 | 5 | 58 | 23.4 |
-| bench.html res=1 | 3 | 58 | 36.0 |
+| bench.html res=1 | 5 | 59 | 31.2 |
 | site default (2x, CRT, auto) before | 8 | 55.5 | 21.5 |
 | site, TV never redrawn (`tv.update = () => false`) | 11 | 57 | 23.4 |
 | site, texture upload only (no draw) | 5 | 57 | 22.8 |
 | site, TV on its own small canvas (no full-canvas redraw) | 4 | 55 | 22.9 |
 | site, cheap CRT shader | 3 | 56.5 | 22.2 |
-| site, 1x (manual) | 2 | 58 | 29.9 |
+| site, 1x (manual) | 4 | 58 | 30.0 |
 | **site default after** (adaptive steps to 1x after ~20-30 s) | 3 | 59 | **29.7** |
+
+Site vs bench at the same resolution: 2x 21.5 vs 23.4 (-8%), 1x 30.0 vs 31.2 (-4%), i.e. within the noise.
+`public/emu` was replaced by the green-stripes fix (71df484) at ~17:30 local, mid-session; runs before/after it
+match (bench 2x 23.1/26.9/23.4 before, 22.7/23.5 after; site 1x 30.7/29.1 before, 29.3/36.2 after).
 
 Smaller window (1253x1295), limiter off: bench res=2 45.7/59.5 vbl/s (19.4/21.7 fps), site 51.8/59 (18.1/20.3),
 site without TV draws 53/67 (18.7/23). Main thread busy: site 4-7%, bench 3-4%.
@@ -42,7 +46,7 @@ Per suspect:
   The scene already redraws only the screen while playing (earlier work below). A version drawing the screen on
   a separate small canvas (no MSAA resolve/copy of the 3440x1440 canvas per frame) measured the same, so it was
   not kept.
-- **resFactor 2 vs 1: the one big lever.** 1x gives +30-55% frames/s (bench 23 -> 36, site 21.5 -> 30) although the
+- **resFactor 2 vs 1: the one big lever.** 1x gives +30-40% frames/s (bench 23.4 -> 31.2, site 21.5 -> 30) although the
   GS thread is only ~55% busy at 2x: on this integrated GPU the GS load at 2x slows the CPU threads (shared power
   budget / memory), and the VU1 thread is the limit. Brave hides the GPU name, so the profile can't tell an iGPU.
 - Auto profile: picked "alto" (2x, full CRT). The adaptive mode judged speed by the frame limiter (it sleeps
