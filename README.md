@@ -1,5 +1,9 @@
 # PS2 WEB
 
+[![License: BSD-2-Clause](https://img.shields.io/badge/license-BSD--2--Clause-green)](LICENSE)
+![Platform: Web](https://img.shields.io/badge/platform-Web-blue)
+![Language: JavaScript](https://img.shields.io/badge/language-JavaScript-F7DF1E)
+
 Play PlayStation 2 games in the browser, with nothing to install.
 
 Pick a game from a shelf of box art, watch the disc go into a 3D PS2, and play on a CRT TV in a
