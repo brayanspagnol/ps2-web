@@ -240,7 +240,7 @@ export function createSettings({ tv, getModule, onChange, onClose, autoDefaults 
       </section>
       <section aria-labelledby="ps2s-h-perf">
         <h3 id="ps2s-h-perf">Desempenho</h3>
-        ${row("perfAuto", "Automático", "Escolhe a qualidade pelo desempenho deste computador e, durante o jogo, alivia o efeito CRT, baixa a resolução ou pula quadros quando o emulador não consegue manter a velocidade total. O que você mudar à mão é mantido.", toggle("perfAuto"))}
+        ${row("perfAuto", "Automático", "Começa na qualidade completa e, durante o jogo, alivia o efeito CRT, baixa a resolução ou pula quadros quando o emulador não consegue manter a velocidade total. O que você mudar à mão é mantido.", toggle("perfAuto"))}
         <dl class="ps2s-perf" data-perf-info></dl>
         <p class="ps2s-note" data-perf-status></p>
       </section>

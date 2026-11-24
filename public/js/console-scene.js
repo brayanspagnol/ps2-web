@@ -58,7 +58,7 @@ export function createConsoleScene(container, opts = {}) {
   // ---------- renderer / scene ----------
   // preserveDrawingBuffer: while nothing but the live layer changes, frames only redraw that layer
   // over the previous one (see frame()).
-  // opts.antialias / opts.shadows = false and a lower opts.maxPixelRatio: lighter scene for weak GPUs (perf.js).
+  // opts.antialias / opts.shadows = false and a lower opts.maxPixelRatio: lighter scene (no caller sets them now).
   const renderer = new THREE.WebGLRenderer({ antialias: opts.antialias ?? true, powerPreference: "high-performance", preserveDrawingBuffer: true });
   renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, opts.maxPixelRatio ?? 2));
   renderer.outputColorSpace = THREE.SRGBColorSpace;

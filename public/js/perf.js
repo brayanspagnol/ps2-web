@@ -1,7 +1,5 @@
-// Performance profile and adaptive quality, so the site runs on weak machines without manual tuning.
-// detectHardware(): what the machine looks like (cores, memory, GPU name, a short CPU benchmark on the main
-// thread and the same on up to 8 workers to see how many cores really run in parallel; Brave reports fewer cores
-// and hides the GPU name, so the benchmark is what counts). pickDefaults(): starting quality for that profile.
+// Measured CPU and adaptive quality, so the site runs on weak machines without manual tuning.
+// detectHardware(): CPU speed and cores that really run in parallel, measured. pickDefaults(): starting settings.
 // createAdaptive(): while a game runs, steps quality down when the emulator can't hold full speed and back up
 // when there is headroom (see the comment above it).
 
@@ -48,27 +46,12 @@ function parallelBench(count) {
   return Promise.race([done, timeout]).finally(() => { workers.forEach((w) => w.terminate()); URL.revokeObjectURL(url); });
 }
 
-function gpuName() {
-  try {
-    const gl = document.createElement("canvas").getContext("webgl2");
-    if (!gl) return { name: "", webgl2: false };
-    const ext = gl.getExtension("WEBGL_debug_renderer_info");
-    const name = String((ext && gl.getParameter(ext.UNMASKED_RENDERER_WEBGL)) || "");
-    gl.getExtension("WEBGL_lose_context")?.loseContext();
-    // Brave answers "Brave" (and Firefox/Safari may give a generic name): unknown, not weak.
-    return { name: /^(brave|webkit webgl|mozilla)$/i.test(name) ? "" : name, webgl2: true };
-  } catch { return { name: "", webgl2: false }; }
-}
-
-// Tier: "alto" (the full look), "medio" (lighter shelf), "basico" (everything cheap).
+// What this machine measurably does: a short CPU benchmark on the main thread and the same on up to 8 workers
+// to see how many cores really run in parallel. Memory, core count and GPU name as reported by browsers are capped,
+// randomized or hidden (Brave), so they are not used.
 // remember = false: this run only (bench.html measurements under simulated slow CPUs).
 export async function detectHardware({ remember = true } = {}) {
   const reported = navigator.hardwareConcurrency || 2;
-  const memGB = navigator.deviceMemory ?? null; // Chromium only, capped at 8
-  const gpu = gpuName();
-  const software = /swiftshader|llvmpipe|softpipe|software|basic render/i.test(gpu.name);
-  // Integrated GPUs that struggle with 2x upscaling + the CRT pass; newer Intel Xe/Arc and AMD APUs are not listed.
-  const weakGpu = software || !gpu.webgl2 || /\b(U?HD Graphics|GMA|Mali|Adreno|PowerVR|VideoCore)\b/i.test(gpu.name);
   let singleMs = benchMs();
   const tried = Math.min(Math.max(reported, 4), 8);
   const alone = (await parallelBench(1))?.[0];
@@ -86,29 +69,21 @@ export async function detectHardware({ remember = true } = {}) {
   }
   if (remember) try { localStorage.setItem(BEST_KEY, JSON.stringify({ singleMs, cores })); } catch {}
   const score = BENCH_REF_MS / singleMs; // 1 = reference machine, 0.5 = half as fast per core
-  let tier = "alto";
-  if (software || cores <= 2 || (memGB && memGB <= 2) || score < 0.35 || (cores <= 4 && (weakGpu || score < 0.6))) tier = "basico";
-  else if (cores <= 4 || weakGpu || (memGB && memGB <= 4) || score < 0.6) tier = "medio";
-  return { cores, reportedCores: reported, parallel: +parallel.toFixed(1), memGB, gpu: gpu.name, weakGpu, software, score: +score.toFixed(2), singleMs: +singleMs.toFixed(1), tier };
+  return { cores, reportedCores: reported, parallel: +parallel.toFixed(1), score: +score.toFixed(2), singleMs: +singleMs.toFixed(1) };
 }
 
-// Starting quality for a profile. resFactor/crt are settings defaults (the player's own choices win);
-// the rest is applied by the page (scene at load, crtCheap/mtvu/audioMs once the emulator is up).
+// Starting settings. Everyone starts at full quality (2x, CRT); the adaptive quality below lowers it from what the
+// game really does. Only what the benchmark measures is decided up front.
 export function pickDefaults(hw) {
-  const low = hw.tier === "basico", mid = hw.tier === "medio";
   return {
-    resFactor: low || hw.weakGpu ? 1 : 2,
-    crt: !hw.software,
-    crtCheap: low,
-    scene: low ? { antialias: false, shadows: false, maxPixelRatio: 1 } : mid ? { antialias: false, shadows: true, maxPixelRatio: 1.5 } : {},
-    fsMaxPixelRatio: low ? 1 : mid ? 1.5 : 2,
+    resFactor: 2,
+    crt: true,
     // VU1 on its own thread needs a free core next to the VM and GS threads (measured: see notes/low-end.md).
     mtvu: hw.cores >= 3,
-    audioMs: low ? 200 : 100,
+    // A slow or 2-core CPU misses audio deadlines more often: a longer buffer avoids gaps.
+    audioMs: hw.cores <= 2 || hw.score < 0.35 ? 200 : 100,
   };
 }
-
-export const TIER_NAMES = { alto: "Alto", medio: "Intermediário", basico: "Básico" };
 
 // ---- Adaptive quality ----------------------------------------------------------------------------------
 // Every 2 s it reads the emulator's per-vblank timeline. The frame limiter's sleep time says whether the game
