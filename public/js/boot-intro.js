@@ -584,6 +584,9 @@ export function startBootIntro({ view, tv, disc, sourceCanvas, frameId, volume =
   let skip = false, fadeStart = 0, rendered = false, stillDrawn = false, resolveDone;
   const done = new Promise((r) => (resolveDone = r));
   if (lastId === null) ready = true;          // old emulator builds: no frame signal, end on time
+  // Also check the picture already there: a fast game (GTA SA, ~11 vblanks) is held at its first picture
+  // before the intro starts and sends no new frame until the intro ends.
+  else lastId = NaN;
 
   const probe = document.createElement("canvas");
   probe.width = 32; probe.height = 24;
@@ -650,7 +653,7 @@ export function startBootIntro({ view, tv, disc, sourceCanvas, frameId, volume =
     const out = noField ? 0 : 1 - smooth(LOGO_T - 0.6, LOGO_T, t);
     U.time.value = t;
     U.master.value = Math.max(0, k);
-    U.flare.value = smooth(0.4, 1.3, t) * (1 - smooth(1.5, 2.8, t));
+    U.flare.value = noField ? 0 : smooth(0.4, 1.3, t) * (1 - smooth(1.5, 2.8, t)); // no recreated flash after the video or a skip
     U.bg.value = smooth(0.8, 2.2, t) * out;
     U.fade.value = smooth(1.2, 2.8, t) * out;
     U.logo.value = smooth(logoStart, logoStart + LOGO_IN, t);

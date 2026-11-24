@@ -13,13 +13,13 @@ const STORE_KEY = "ps2web.settings";
 const B = { LX: 0, LY: 1, RX: 2, RY: 3, UP: 4, DOWN: 5, LEFT: 6, RIGHT: 7, SELECT: 8, START: 9,
   SQUARE: 10, TRIANGLE: 11, CIRCLE: 12, CROSS: 13, L1: 14, L2: 15, L3: 16, R1: 17, R2: 18, R3: 19 };
 
-// Same defaults as the emulator (InputProviderEmscripten.cpp). pad = W3C "standard" gamepad button;
+// Defaults: as the emulator (InputProviderEmscripten.cpp), except arrows move the left stick and TFGH is the D-pad. pad = W3C "standard" gamepad button;
 // stick directions only have keys (the gamepad sticks are always the analog sticks).
 const CONTROLS = [
-  { id: "up", label: "Direcional ↑", button: B.UP, key: "ArrowUp", pad: 12 },
-  { id: "down", label: "Direcional ↓", button: B.DOWN, key: "ArrowDown", pad: 13 },
-  { id: "left", label: "Direcional ←", button: B.LEFT, key: "ArrowLeft", pad: 14 },
-  { id: "right", label: "Direcional →", button: B.RIGHT, key: "ArrowRight", pad: 15 },
+  { id: "up", label: "Direcional ↑", button: B.UP, key: "KeyT", pad: 12 },
+  { id: "down", label: "Direcional ↓", button: B.DOWN, key: "KeyG", pad: 13 },
+  { id: "left", label: "Direcional ←", button: B.LEFT, key: "KeyF", pad: 14 },
+  { id: "right", label: "Direcional →", button: B.RIGHT, key: "KeyH", pad: 15 },
   { id: "cross", label: "✕ Xis", button: B.CROSS, key: "KeyZ", pad: 0 },
   { id: "circle", label: "◯ Bola", button: B.CIRCLE, key: "KeyX", pad: 1 },
   { id: "square", label: "▢ Quadrado", button: B.SQUARE, key: "KeyA", pad: 2 },
@@ -32,10 +32,10 @@ const CONTROLS = [
   { id: "r2", label: "R2", button: B.R2, key: "Digit9", pad: 7 },
   { id: "l3", label: "L3 (clique do analógico esq.)", button: B.L3, key: "Digit3", pad: 10 },
   { id: "r3", label: "R3 (clique do analógico dir.)", button: B.R3, key: "Digit0", pad: 11 },
-  { id: "lsl", label: "Analógico esq. ←", button: B.LX, positive: false, key: "KeyF" },
-  { id: "lsr", label: "Analógico esq. →", button: B.LX, positive: true, key: "KeyH" },
-  { id: "lsu", label: "Analógico esq. ↑", button: B.LY, positive: false, key: "KeyT" },
-  { id: "lsd", label: "Analógico esq. ↓", button: B.LY, positive: true, key: "KeyG" },
+  { id: "lsl", label: "Analógico esq. ←", button: B.LX, positive: false, key: "ArrowLeft" },
+  { id: "lsr", label: "Analógico esq. →", button: B.LX, positive: true, key: "ArrowRight" },
+  { id: "lsu", label: "Analógico esq. ↑", button: B.LY, positive: false, key: "ArrowUp" },
+  { id: "lsd", label: "Analógico esq. ↓", button: B.LY, positive: true, key: "ArrowDown" },
   { id: "rsl", label: "Analógico dir. ←", button: B.RX, positive: false, key: "KeyJ" },
   { id: "rsr", label: "Analógico dir. →", button: B.RX, positive: true, key: "KeyL" },
   { id: "rsu", label: "Analógico dir. ↑", button: B.RY, positive: false, key: "KeyI" },
@@ -50,14 +50,14 @@ export const DEFAULTS = {
   resFactor: 2, bilinear: false, widescreen: false, fill: false,
   crt: true, scanlines: 1, curvature: 1, bloom: 1,
   volume: 1, muted: false,
-  frameLimit: true, intro: true, perfAuto: true,
+  frameLimit: true, intro: true, perfAuto: true, perfAdapt: false,
   keys: {}, pad: {}, // control id -> key code / gamepad button, only where it differs from the default
 };
 // Settings the performance profile may choose (perf.js pickDefaults) while the player has not set them.
 const AUTO_KEYS = ["resFactor", "crt"];
 const RANGES = { resFactor: [1, 4], scanlines: [0, 2], curvature: [0, 2], bloom: [0, 2], volume: [0, 1] };
 const GROUP = { resFactor: "gs", bilinear: "gs", widescreen: "gs", fill: "gs", crt: "crt", scanlines: "crt",
-  curvature: "crt", bloom: "crt", volume: "audio", muted: "audio", frameLimit: "limit", intro: "intro", perfAuto: "perf" };
+  curvature: "crt", bloom: "crt", volume: "audio", muted: "audio", frameLimit: "limit", intro: "intro", perfAuto: "perf", perfAdapt: "perf" };
 
 // localStorage is untrusted input (old versions, edits by hand): keep only valid values.
 function sanitize(raw) {
@@ -107,7 +107,7 @@ function bindings(s) {
   return [CONTROLS.map((c) => [keyOf(s, c), c.button, !!c.positive]), pad];
 }
 
-// One line for the HUD, e.g. "↑↓←→ direcional · Z ✕ · X ◯ · … · FTGH / IJKL analógicos".
+// One line for the HUD, e.g. "TGFH direcional · Z ✕ · X ◯ · … · ←↑↓→ / JIKL analógicos".
 export function keyHint(s) {
   const k = (id) => keyName(keyOf(s, CONTROLS.find((c) => c.id === id)));
   const join = (ids) => { const n = ids.map(k); return n.every((x) => x.length === 1) ? n.join("") : n.join("/"); };
@@ -240,7 +240,8 @@ export function createSettings({ tv, getModule, onChange, onClose, autoDefaults 
       </section>
       <section aria-labelledby="ps2s-h-perf">
         <h3 id="ps2s-h-perf">Desempenho</h3>
-        ${row("perfAuto", "Automático", "Começa na qualidade completa e, durante o jogo, alivia o efeito CRT, baixa a resolução ou pula quadros quando o emulador não consegue manter a velocidade total. O que você mudar à mão é mantido.", toggle("perfAuto"))}
+        ${row("perfAuto", "Automático", "Ajusta a thread do VU1 e a folga do som ao processador medido.", toggle("perfAuto"))}
+        ${row("perfAdapt", "Reduzir qualidade quando lento", "Durante o jogo, alivia o efeito CRT, baixa a resolução ou pula quadros quando o emulador não consegue manter a velocidade total. O que você mudar à mão é mantido.", toggle("perfAdapt"))}
         <dl class="ps2s-perf" data-perf-info></dl>
         <p class="ps2s-note" data-perf-status></p>
       </section>
